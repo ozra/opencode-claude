@@ -747,6 +747,10 @@ async function handleChatCompletions(
         parkControl.cancel?.();
         if (raced.value.done) break;
         const event = raced.value.value;
+        assertOpenCodeToolsRegistered(
+          event,
+          bridgeOpenCodeTools ? openCodeToolNames.length : 0,
+        );
         const sessionId = extractSessionId(event);
         if (sessionId) {
           setForeignSessionId(conversationKey, sessionId, {
@@ -797,6 +801,62 @@ function extractSessionId(event: unknown): string | null {
   return null;
 }
 
+/**
+ * The `init` event is the only place the CLI reports what it actually
+ * registered. Registering N tools and never reading it back is how a total
+ * bridge failure (bad zod shape, server that refuses to connect) turns into a
+ * turn where Claude has no tools, hallucinates their output, and looks like a
+ * model problem. Fail the turn truthfully instead.
+ *
+ * Only fires on a *confirmed* mismatch: a shape we can't read is left alone so
+ * an SDK field rename degrades to today's behaviour rather than breaking every
+ * turn.
+ */
+function assertOpenCodeToolsRegistered(
+  event: unknown,
+  expectedCount: number,
+): void {
+  if (expectedCount === 0) return;
+  if (!event || typeof event !== "object") return;
+  const e = event as Record<string, unknown>;
+  if (e.type !== "system" || e.subtype !== "init") return;
+
+  const servers = Array.isArray(e.mcp_servers)
+    ? (e.mcp_servers as Array<{ name?: unknown; status?: unknown }>)
+    : null;
+  const server = servers?.find((s) => s?.name === "opencode");
+  const status = typeof server?.status === "string" ? server.status : null;
+
+  const exposed = Array.isArray(e.tools)
+    ? (e.tools as unknown[]).filter(
+        (t): t is string =>
+          typeof t === "string" && t.startsWith("mcp__opencode__"),
+      ).length
+    : null;
+
+  log.info("[opencode-claude] MCP bridge init", {
+    registered: expectedCount,
+    exposed,
+    serverStatus: status ?? (servers ? "absent" : "unknown"),
+  });
+
+  if (servers && !server) {
+    throw new Error(
+      `OpenCode tool bridge failed: the "opencode" MCP server is missing from the session (registered ${expectedCount} tools). The turn was stopped because Claude would have run with no tools.`,
+    );
+  }
+  if (status !== null && status !== "connected") {
+    throw new Error(
+      `OpenCode tool bridge failed: MCP server "opencode" reported status "${status}" (registered ${expectedCount} tools). The turn was stopped because Claude would have run with no tools.`,
+    );
+  }
+  if (exposed === 0) {
+    throw new Error(
+      `OpenCode tool bridge failed: registered ${expectedCount} tools but the session exposed 0 mcp__opencode__* tools. The turn was stopped because Claude would have run with no tools and invented their results.`,
+    );
+  }
+}
+
 async function buildOpenCodeMcpServer(
   tools: OpenAITool[],
   pendingTools: Map<string, ParkedToolCall>,
@@ -839,7 +899,11 @@ async function buildOpenCodeMcpServer(
         else if (type === "number" || type === "integer") field = z.number();
         else if (type === "boolean") field = z.boolean();
         else if (type === "array") field = z.array(z.any());
-        else if (type === "object") field = z.record(z.string(), z.any());
+        // Must be a loose object, NOT z.record(): the SDK converts these shapes
+        // back to JSON Schema for the MCP registration handshake, and a record
+        // serializes to a form the server rejects — every tool in the batch is
+        // dropped and `init` reports 0 tools while the plugin thinks it sent N.
+        else if (type === "object") field = z.object({}).passthrough();
         if (!required.has(key)) {
           field = (field as { optional: () => unknown }).optional();
         }
