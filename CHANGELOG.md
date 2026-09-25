@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- **Opus 5.5**: the `opus` alias now tracks the current Opus generation and is
+  displayed as **Opus 5.5**; the previous generation stays selectable as a
+  pinned **Opus 5** (`claude-opus-5`) alongside the existing pinned models.
+
 ## 0.13.1 - 2026-08-18
 
 - **Fix: turn stall watchdog** — a Claude turn that went totally silent (dead

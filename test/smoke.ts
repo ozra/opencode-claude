@@ -330,6 +330,13 @@ async function main() {
   assert.ok(models.some((m) => m.id === "opus"));
   assert.equal(resolveClaudeModelId("haiku"), "claude-haiku-4-5");
   assert.equal(resolveClaudeModelId("sonnet"), "sonnet");
+  // The opus alias tracks the current Opus generation (5.5 now); the previous
+  // generation stays available as a pinned model.
+  assert.equal(
+    CLAUDE_CODE_MODELS.find((m) => m.id === "opus")?.name,
+    "Opus 5.5",
+  );
+  assert.ok(CLAUDE_CODE_MODELS.some((m) => m.id === "claude-opus-5"));
 
   const sonnet = CLAUDE_CODE_MODELS.find((m) => m.id === "sonnet")!;
   const variants = buildEffortVariants(sonnet);
