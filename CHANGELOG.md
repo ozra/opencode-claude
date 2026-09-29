@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- **Sonnet 5.5**: the `sonnet` alias now tracks the current Sonnet generation and is
+  displayed as **Sonnet 5.5**; the previous generation stays selectable as a
+  pinned **Sonnet 5** (`claude-sonnet-5`).
 - **Opus 5.5**: the `opus` alias now tracks the current Opus generation and is
   displayed as **Opus 5.5**; the previous generation stays selectable as a
   pinned **Opus 5** (`claude-opus-5`) alongside the existing pinned models.

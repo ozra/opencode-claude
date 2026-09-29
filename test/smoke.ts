@@ -337,6 +337,12 @@ async function main() {
     "Opus 5.5",
   );
   assert.ok(CLAUDE_CODE_MODELS.some((m) => m.id === "claude-opus-5"));
+  // Same for sonnet: alias tracks 5.5, previous generation pinned.
+  assert.equal(
+    CLAUDE_CODE_MODELS.find((m) => m.id === "sonnet")?.name,
+    "Sonnet 5.5",
+  );
+  assert.ok(CLAUDE_CODE_MODELS.some((m) => m.id === "claude-sonnet-5"));
 
   const sonnet = CLAUDE_CODE_MODELS.find((m) => m.id === "sonnet")!;
   const variants = buildEffortVariants(sonnet);
