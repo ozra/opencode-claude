@@ -49,11 +49,18 @@ function fromAnthropicUsage(usage: Record<string, unknown>): OpenAIUsage {
   const details: NonNullable<OpenAIUsage["prompt_tokens_details"]> = {};
   if (cached > 0) details.cached_tokens = cached;
   if (cacheWrite > 0) details.cache_write_tokens = cacheWrite;
+  const outputDetails = usage.output_tokens_details as
+    | Record<string, unknown>
+    | undefined;
+  const thinking = asNumber(outputDetails?.thinking_tokens);
   return {
     prompt_tokens: prompt,
     completion_tokens: completion,
     total_tokens: prompt + completion,
     ...(Object.keys(details).length ? { prompt_tokens_details: details } : {}),
+    ...(thinking > 0
+      ? { completion_tokens_details: { reasoning_tokens: thinking } }
+      : {}),
   };
 }
 
@@ -192,6 +199,146 @@ export function addOpenAIUsage(
       : {}),
     ...(reasoning > 0
       ? { completion_tokens_details: { reasoning_tokens: reasoning } }
+      : {}),
+  };
+}
+
+/** Stream-event usage (message_start / message_delta) as OpenAI usage. */
+export function usageFromAnthropic(usage: unknown): OpenAIUsage | null {
+  if (!usage || typeof usage !== "object") return null;
+  return fromAnthropicUsage(usage as Record<string, unknown>);
+}
+
+function maxUsage(a: OpenAIUsage, b: OpenAIUsage): OpenAIUsage {
+  const pick = (x?: number, y?: number) => Math.max(x ?? 0, y ?? 0);
+  const cached = pick(
+    a.prompt_tokens_details?.cached_tokens,
+    b.prompt_tokens_details?.cached_tokens,
+  );
+  const cacheWrite = pick(
+    a.prompt_tokens_details?.cache_write_tokens,
+    b.prompt_tokens_details?.cache_write_tokens,
+  );
+  const reasoning = pick(
+    a.completion_tokens_details?.reasoning_tokens,
+    b.completion_tokens_details?.reasoning_tokens,
+  );
+  const prompt = pick(a.prompt_tokens, b.prompt_tokens);
+  const completion = pick(a.completion_tokens, b.completion_tokens);
+  const promptDetails: NonNullable<OpenAIUsage["prompt_tokens_details"]> = {};
+  if (cached > 0) promptDetails.cached_tokens = cached;
+  if (cacheWrite > 0) promptDetails.cache_write_tokens = cacheWrite;
+  return {
+    prompt_tokens: prompt,
+    completion_tokens: completion,
+    total_tokens: prompt + completion,
+    ...(Object.keys(promptDetails).length
+      ? { prompt_tokens_details: promptDetails }
+      : {}),
+    ...(reasoning > 0
+      ? { completion_tokens_details: { reasoning_tokens: reasoning } }
+      : {}),
+  };
+}
+
+/** Field-wise `a - b`, clamped at zero; null when nothing grew. */
+function usageGrowth(a: OpenAIUsage, b: OpenAIUsage | null): OpenAIUsage | null {
+  if (!b) return { ...a };
+  const diff = (x?: number, y?: number) => Math.max(0, (x ?? 0) - (y ?? 0));
+  const prompt = diff(a.prompt_tokens, b.prompt_tokens);
+  const completion = diff(a.completion_tokens, b.completion_tokens);
+  const cached = diff(
+    a.prompt_tokens_details?.cached_tokens,
+    b.prompt_tokens_details?.cached_tokens,
+  );
+  const cacheWrite = diff(
+    a.prompt_tokens_details?.cache_write_tokens,
+    b.prompt_tokens_details?.cache_write_tokens,
+  );
+  const reasoning = diff(
+    a.completion_tokens_details?.reasoning_tokens,
+    b.completion_tokens_details?.reasoning_tokens,
+  );
+  if (prompt + completion + cached + cacheWrite + reasoning === 0) return null;
+  const promptDetails: NonNullable<OpenAIUsage["prompt_tokens_details"]> = {};
+  if (cached > 0) promptDetails.cached_tokens = cached;
+  if (cacheWrite > 0) promptDetails.cache_write_tokens = cacheWrite;
+  return {
+    prompt_tokens: prompt,
+    completion_tokens: completion,
+    total_tokens: prompt + completion,
+    ...(Object.keys(promptDetails).length
+      ? { prompt_tokens_details: promptDetails }
+      : {}),
+    ...(reasoning > 0
+      ? { completion_tokens_details: { reasoning_tokens: reasoning } }
+      : {}),
+  };
+}
+
+/**
+ * Per-HTTP-response usage, one entry per Anthropic API call. The SDK reports
+ * a call's usage several times: the assistant events carry the message_start
+ * snapshot (output_tokens ≈ 1-4) and only message_delta has the final
+ * output. Keeping the max per message id makes the final numbers win.
+ *
+ * `reported` spans continuations of one bridge and holds what each call has
+ * already been reported as. A park can hand off before a call's
+ * message_delta arrives; the resumed response then sees that delta and
+ * reports only the growth over the earlier snapshot, so nothing is counted
+ * twice and the final output tokens are not lost.
+ *
+ * Output tokens add up over the calls of a response. Prompt tokens don't:
+ * OpenCode reads them as the size of the context, and compacts when they
+ * reach the model's input limit, so they are the last call's prompt (the
+ * context as it stands), not the sum of every call's prompt.
+ */
+export class TurnUsageTracker {
+  private readonly byId = new Map<
+    string,
+    { baseline: OpenAIUsage | null; max: OpenAIUsage }
+  >();
+  private anonymous: OpenAIUsage | null = null;
+
+  constructor(private readonly reported: Map<string, OpenAIUsage>) {}
+
+  add(usage: OpenAIUsage, messageId: string | null): void {
+    if (!messageId) {
+      this.anonymous = addOpenAIUsage(this.anonymous, usage);
+      return;
+    }
+    let entry = this.byId.get(messageId);
+    if (!entry) {
+      const baseline = this.reported.get(messageId) ?? null;
+      entry = { baseline, max: baseline ?? usage };
+      this.byId.set(messageId, entry);
+    }
+    entry.max = maxUsage(entry.max, usage);
+    this.reported.set(messageId, entry.max);
+  }
+
+  total(): OpenAIUsage | null {
+    let sum = this.anonymous ? { ...this.anonymous } : null;
+    let last: OpenAIUsage | null = null;
+    for (const { baseline, max } of this.byId.values()) {
+      last = max;
+      const growth = usageGrowth(max, baseline);
+      if (growth) sum = addOpenAIUsage(sum, growth);
+    }
+    if (!sum || !last) return sum;
+    return withPromptOf(sum, last);
+  }
+}
+
+/** `usage` with the prompt side (context size) taken from `call`. */
+function withPromptOf(usage: OpenAIUsage, call: OpenAIUsage): OpenAIUsage {
+  const { prompt_tokens_details: _dropped, ...rest } = usage;
+  return {
+    ...rest,
+    prompt_tokens: call.prompt_tokens,
+    total_tokens: call.prompt_tokens + usage.completion_tokens,
+    ...(call.prompt_tokens_details
+      ? { prompt_tokens_details: { ...call.prompt_tokens_details } }
       : {}),
   };
 }

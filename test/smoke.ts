@@ -6,12 +6,21 @@ import { spawnSync } from "node:child_process";
 import { EventEmitter } from "node:events";
 
 async function main() {
+  // Keep the user's real plugin data (session bindings, debug log) untouched.
+  const { mkdtempSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  process.env.XDG_DATA_HOME = mkdtempSync(`${tmpdir()}/opencode-claude-smoke-`);
+  // Mocked turns ignore interrupt(); don't wait the real grace for them.
+  process.env.OPENCODE_CLAUDE_STOP_GRACE_MS = "50";
+  // Fake Claude transcripts go to a temp config dir, never ~/.claude.
+  process.env.CLAUDE_CONFIG_DIR = mkdtempSync(`${tmpdir()}/opencode-claude-smoke-cfg-`);
   const { buildClaudeCodeChildEnv } = await import("../src/auth-env.ts");
   const {
     interpretClaudeAuthStatus,
   } = await import("../src/detect.ts");
   const {
-    CLAUDE_CODE_MODELS,
+    modelsFromSdk,
+    setDiscoveredModels,
     buildEffortVariants,
     getClaudeModels,
     resolveClaudeModelId,
@@ -32,6 +41,8 @@ async function main() {
     buildAuthMethods,
     manualInstallResponse,
     ClaudeCodePlugin,
+    buildProviderInfo,
+    buildClaudeProviderModels,
   } = await import("../src/index.ts");
   const {
     startProxy,
@@ -39,7 +50,191 @@ async function main() {
     getProxyPort,
     getClaudeProxyBaseUrl,
     PROXY_IDLE_TIMEOUT_SECONDS,
+    isTrustedLocalRequest,
+    buildOpenCodeMcpServer,
+    resolveMetaKind,
   } = await import("../src/proxy.ts");
+
+  // One-shot turns reach the SDK isolated from user MCP and connectors
+  {
+    const { startClaudeQuery } = await import("../src/query.ts");
+    let seen: any;
+    await startClaudeQuery({
+      prompt: "x",
+      cwd: process.cwd(),
+      isolateMcp: true,
+      persistSession: false,
+      queryImpl: () => (input: any) => {
+        seen = input.options;
+        return (async function* () {})();
+      },
+    } as any);
+    assert.equal(seen.strictMcpConfig, true);
+    assert.equal(seen.settings.disableClaudeAiConnectors, true);
+    assert.equal(seen.persistSession, false);
+
+    // Thinking streams as summaries unless thinking is off
+    assert.equal(seen.settings.showThinkingSummaries, true);
+    assert.deepEqual(seen.extraArgs, { "thinking-display": "summarized" });
+    await startClaudeQuery({
+      prompt: "x",
+      cwd: process.cwd(),
+      thinking: { type: "disabled" },
+      queryImpl: () => (input: any) => {
+        seen = input.options;
+        return (async function* () {})();
+      },
+    } as any);
+    assert.equal(seen.extraArgs, undefined);
+    assert.equal(seen.settings?.showThinkingSummaries, undefined);
+  }
+
+  // Usage: the final message_delta count wins over the opening snapshot
+  {
+    const { TurnUsageTracker, usageFromAnthropic } = await import("../src/usage.ts");
+    const seen = new Map<string, any>();
+    const tracker = new TurnUsageTracker(seen);
+    const start = usageFromAnthropic({ input_tokens: 8, cache_read_input_tokens: 800, output_tokens: 4 })!;
+    const final = usageFromAnthropic({ input_tokens: 8, cache_read_input_tokens: 800, output_tokens: 191, output_tokens_details: { thinking_tokens: 112 } })!;
+    tracker.add(start, "msg_1");
+    tracker.add(start, "msg_1");
+    tracker.add(final, "msg_1");
+    tracker.add(start, "msg_1");
+    tracker.add(usageFromAnthropic({ input_tokens: 2, cache_read_input_tokens: 1000, output_tokens: 50 })!, "msg_2");
+    const total = tracker.total()!;
+    assert.equal(total.completion_tokens, 241);
+    // Output adds up over the calls; the prompt is the last call's context.
+    assert.equal(total.prompt_tokens, 1002);
+    assert.equal(total.prompt_tokens_details?.cached_tokens, 1000);
+    assert.equal(total.completion_tokens_details?.reasoning_tokens, 112);
+    // A continuation response does not recount calls reported earlier
+    const next = new TurnUsageTracker(seen);
+    next.add(final, "msg_1");
+    assert.equal(next.total(), null);
+
+    // A park handed off before message_delta: the resumed response reports
+    // only the growth of that call, once.
+    const reported = new Map<string, any>();
+    const parkedResp = new TurnUsageTracker(reported);
+    parkedResp.add(start, "msg_p");
+    assert.equal(parkedResp.total()!.completion_tokens, 4);
+    assert.equal(parkedResp.total()!.prompt_tokens, 808);
+    const resumed = new TurnUsageTracker(reported);
+    resumed.add(final, "msg_p");
+    resumed.add(usageFromAnthropic({ input_tokens: 3, output_tokens: 9 })!, "msg_q");
+    const grown = resumed.total()!;
+    assert.equal(grown.completion_tokens, 187 + 9);
+    assert.equal(grown.prompt_tokens, 3);
+    assert.equal(grown.completion_tokens_details?.reasoning_tokens, 112);
+    const again = new TurnUsageTracker(reported);
+    again.add(final, "msg_p");
+    assert.equal(again.total(), null);
+  }
+
+  // Utility turns carry OpenCode's instructions in the user message
+  {
+    const { withLeadingText } = await import("../src/prompt.ts");
+    assert.equal(withLeadingText("body", "<instructions>x</instructions>"), "<instructions>x</instructions>\n\nbody");
+    const withImage: any = withLeadingText(
+      { type: "user", message: { role: "user", content: [{ type: "image", source: { type: "base64", media_type: "image/png", data: "AA==" } }] }, parent_tool_use_id: null } as any,
+      "lead",
+    );
+    assert.deepEqual(withImage.message.content.map((b: any) => b.type), ["text", "image"]);
+  }
+
+  // Code Mode catalog: only that section of OpenCode's system prompt is kept
+  {
+    const { codeModeCatalog } = await import("../src/request-kind.ts");
+    const system = "You are an AI agent running in OpenCode.\n\n# Your Model\nclaude-code\n\n# Code Mode\n\nUse the `execute` tool to call the tools listed below.\n\n## Available tools\n\n- openchamber (1 tool)\n  - tools.openchamber.read({ path: string }): Promise<string> // Read\n\n# Skills\nfoo";
+    const catalog = codeModeCatalog([{ role: "system", content: system }, { role: "user", content: "hi" }]);
+    assert.match(catalog, /^# Code Mode/);
+    assert.match(catalog, /tools\.openchamber/);
+    assert.doesNotMatch(catalog, /Your Model|running in OpenCode|# Skills/);
+    assert.equal(codeModeCatalog([{ role: "user", content: "hi" }]), "");
+  }
+
+  // Request kinds: hooked session requests vs stateless generation
+  {
+    const plain = [{ role: "user", content: "Write a commit message" }];
+    assert.equal(resolveMetaKind("primary", "ses_1", plain as any), null);
+    assert.equal(resolveMetaKind("title", "ses_1", plain as any), "title");
+    assert.equal(resolveMetaKind("compaction", "ses_1", plain as any), "summary");
+    assert.equal(resolveMetaKind("generate", "ses_1", plain as any), "generate");
+    // /api/experimental/generate bypasses session hooks: no plugin headers
+    assert.equal(resolveMetaKind(null, null, plain as any), "generate");
+  }
+
+  // Tool schemas reach Claude verbatim; unnamed args still reach OpenCode
+  {
+    const parameters = {
+      type: "object",
+      properties: {
+        filePath: { type: "string", description: "Absolute path" },
+        mode: { type: "string", enum: ["a", "b"] },
+        edits: {
+          type: "array",
+          items: {
+            type: "object",
+            properties: { old: { type: "string" }, new: { type: "string" } },
+            required: ["old", "new"],
+          },
+        },
+        limit: { type: "integer", minimum: 1 },
+      },
+      required: ["filePath"],
+    };
+    const parked = new Map<string, any>();
+    const servers: any = await buildOpenCodeMcpServer(
+      [{ type: "function", function: { name: "edit", description: "Edit a file", parameters } }] as any,
+      parked,
+      () => {
+        for (const call of parked.values()) call.resolve([{ type: "text", text: "done" }]);
+      },
+    );
+    const handlers = servers.opencode.instance.server._requestHandlers;
+    const listed = await handlers.get("tools/list")({ method: "tools/list", params: {} }, {});
+    assert.deepEqual(listed.tools[0].inputSchema, parameters);
+    await handlers.get("tools/call")(
+      {
+        method: "tools/call",
+        params: { name: "edit", arguments: { filePath: "/a", extra: 1, edits: [{ old: "x", new: "y" }] } },
+      },
+      { signal: new AbortController().signal, sendNotification: async () => {}, sendRequest: async () => {} },
+    );
+    const sent = JSON.parse([...parked.values()][0].arguments);
+    assert.deepEqual(sent, { filePath: "/a", extra: 1, edits: [{ old: "x", new: "y" }] });
+  }
+
+  // Plan-only gate: API-key and cloud-provider CLI logins are refused
+  const { setAuthStatusProbe, checkSubscriptionAuth } =
+    await import("../src/detect.ts");
+  assert.equal(
+    interpretClaudeAuthStatus({ loggedIn: true, authMethod: "claude.ai", apiProvider: "firstParty" }).loggedIn,
+    true,
+  );
+  assert.equal(
+    interpretClaudeAuthStatus({ loggedIn: true, authMethod: "claude.ai", apiProvider: "bedrock" }).detail,
+    "third-party-provider",
+  );
+  setAuthStatusProbe(() => ({ loggedIn: false, detail: "api-key-only" }));
+  assert.match(String(await checkSubscriptionAuth()), /API key/);
+  setAuthStatusProbe(() => ({ loggedIn: true, detail: "auth-status-oauth" }));
+  assert.equal(await checkSubscriptionAuth(), null);
+  // Remaining proxy tests run against a signed-in plan.
+
+  // Browser pages must not reach the loopback proxy (CSRF / DNS rebinding)
+  const probe = (headers: Record<string, string>) =>
+    isTrustedLocalRequest(
+      new Request("http://127.0.0.1:1/v1/models", { headers }),
+    );
+  assert.equal(probe({ host: "127.0.0.1:4096" }), true);
+  assert.equal(probe({ host: "localhost:4096" }), true);
+  assert.equal(probe({ host: "[::1]:4096" }), true);
+  assert.equal(
+    probe({ host: "127.0.0.1:4096", origin: "https://evil.example" }),
+    false,
+  );
+  assert.equal(probe({ host: "rebind.evil.example:4096" }), false);
 
   // Auth env stripping
   const cleaned = buildClaudeCodeChildEnv({
@@ -233,10 +428,10 @@ async function main() {
     );
     chmodSync(fake, 0o755);
 
-    assert.equal(resolveClaudeCli({ PATH: "/usr/bin:/bin", HOME: home }), fake);
+    assert.equal(await resolveClaudeCli({ PATH: "/usr/bin:/bin", HOME: home }), fake);
     // And PATH itself still wins when the CLI is on it.
     assert.equal(
-      resolveClaudeCli({ PATH: "/usr/bin:/bin", HOME: home }).length > 0,
+      (await resolveClaudeCli({ PATH: "/usr/bin:/bin", HOME: home }))!.length > 0,
       true,
     );
   }
@@ -326,37 +521,63 @@ async function main() {
   // Models / effort
   const models = getClaudeModels();
   assert.ok(models.length >= 4);
-  assert.ok(models.some((m) => m.id === "sonnet"));
-  assert.ok(models.some((m) => m.id === "opus"));
-  assert.equal(resolveClaudeModelId("haiku"), "claude-haiku-4-5");
+  assert.ok(models.some((m) => m.id === "claude-sonnet-5"));
+  assert.ok(models.some((m) => m.id === "claude-opus-5-5[1m]"));
+  // 1.0 aliases are no longer listed; the proxy itself still passes them on
+  assert.ok(!models.some((m) => m.id === "opus" || m.id === "sonnet"));
   assert.equal(resolveClaudeModelId("sonnet"), "sonnet");
-  // The opus alias tracks the current Opus generation (5.5 now); the previous
-  // generation stays available as a pinned model.
-  assert.equal(
-    CLAUDE_CODE_MODELS.find((m) => m.id === "opus")?.name,
-    "Opus 5.5",
-  );
-  assert.ok(CLAUDE_CODE_MODELS.some((m) => m.id === "claude-opus-5"));
-  // Same for sonnet: alias tracks 5.5, previous generation pinned.
-  assert.equal(
-    CLAUDE_CODE_MODELS.find((m) => m.id === "sonnet")?.name,
-    "Sonnet 5.5",
-  );
-  assert.ok(CLAUDE_CODE_MODELS.some((m) => m.id === "claude-sonnet-5"));
+  assert.equal(resolveClaudeModelId("opus[1m]"), "opus[1m]");
 
-  const sonnet = CLAUDE_CODE_MODELS.find((m) => m.id === "sonnet")!;
+  const sonnet = getClaudeModels().find((m) => m.id === "claude-sonnet-5")!;
   const variants = buildEffortVariants(sonnet);
-  for (const level of EFFORT_LEVELS) {
-    assert.ok(variants[level]);
-    assert.equal(isClaudeEffort(level), true);
-    assert.ok(
-      variants[level] &&
-        typeof variants[level] === "object" &&
-        "effort" in variants[level],
-    );
+  assert.deepEqual(variants, [...EFFORT_LEVELS]);
+  for (const level of EFFORT_LEVELS) assert.equal(isClaudeEffort(level), true);
+  assert.equal(sonnet.contextWindow, 1_000_000, "Sonnet 5 runs at 1M natively");
+  // Haiku takes no effort, so it gets no effort variants
+  assert.deepEqual(
+    buildEffortVariants(getClaudeModels().find((m) => m.id === "claude-haiku-4-5")!),
+    [],
+  );
+
+  // Names come from the concrete model id, not the CLI's version-dependent label
+  {
+    const { modelNameFromId } = await import("../src/models.ts");
+    assert.equal(modelNameFromId("claude-opus-5-5"), "Opus 5.5");
+    assert.equal(modelNameFromId("claude-opus-5[1m]"), "Opus 5");
+    assert.equal(modelNameFromId("claude-haiku-4-5-20251001"), "Haiku 4.5");
+    assert.equal(modelNameFromId("opus"), undefined);
+    const [row] = modelsFromSdk([
+      { value: "opus[1m]", displayName: "Opus (1M context)", resolvedModel: "claude-opus-5[1m]" },
+    ]);
+    assert.equal(row!.name, "Opus 5");
   }
-  assert.deepEqual(variants.none, { disabled: true });
-  assert.deepEqual(variants.minimal, { disabled: true });
+
+  // The CLI's own model list becomes the catalog, with t3code's 1M rules
+  {
+    const fromCli = modelsFromSdk([
+      { value: "default", displayName: "Default (recommended)", resolvedModel: "claude-opus-5-5", supportedEffortLevels: ["low", "high"] },
+      { value: "opus", displayName: "Opus 5.5", resolvedModel: "claude-opus-5-5", supportedEffortLevels: ["low", "high"] },
+      { value: "sonnet", displayName: "Sonnet 5", resolvedModel: "claude-sonnet-5", supportedEffortLevels: ["low", "high"] },
+      { value: "claude-opus-4-8", displayName: "Opus 4.8", resolvedModel: "claude-opus-4-8" },
+      { value: "haiku", displayName: "Haiku 4.5", resolvedModel: "claude-haiku-4-5-20251001" },
+    ]);
+    const byId = Object.fromEntries(fromCli.map((m) => [m.id, m]));
+    assert.deepEqual(
+      fromCli.map((m) => m.id),
+      ["claude-opus-5-5[1m]", "claude-sonnet-5", "claude-opus-4-8", "claude-haiku-4-5-20251001"],
+    );
+    assert.equal(byId["claude-opus-5-5[1m]"]!.contextWindow, 1_000_000);
+    assert.equal(byId["claude-opus-5-5[1m]"]!.name, "Opus 5.5");
+    assert.deepEqual(buildEffortVariants(byId["claude-opus-5-5[1m]"]!), ["low", "high"]);
+    assert.equal(byId["claude-sonnet-5"]!.contextWindow, 1_000_000);
+    assert.equal(byId["claude-opus-4-8"]!.contextWindow, 1_000_000);
+    assert.deepEqual(buildEffortVariants(byId["claude-haiku-4-5-20251001"]!), []);
+    assert.equal(setDiscoveredModels(fromCli), true);
+    const ids = getClaudeModels().map((m) => m.id);
+    assert.ok(!ids.includes("fable"), "old aliases are not listed");
+    assert.equal(resolveClaudeModelId("fable"), "fable", "old aliases still reach the CLI");
+    assert.equal(setDiscoveredModels(fromCli), false, "unchanged list is not a change");
+  }
   assert.equal(isClaudeEffort("nope"), false);
 
   const selection = resolveClaudeModelSelection("sonnet", "high");
@@ -515,7 +736,8 @@ async function main() {
       { role: "tool", tool_call_id: "c1", content: "x".repeat(5000) },
     ]);
     assert.match(withTools, /\[called tool: bash\]/);
-    assert.match(withTools, /Tool result/);
+    // the result is labelled with the tool it answers, not the call id
+    assert.match(withTools, /Tool result \(bash\):/);
     assert.match(withTools, /chars omitted/);
 
     // budget keeps the NEWEST messages, drops oldest first
@@ -732,7 +954,7 @@ async function main() {
     const { readFileSync, unlinkSync, existsSync } = await import("node:fs");
     const { join } = await import("node:path");
     const { homedir } = await import("node:os");
-    const logPath = join(homedir(), ".local", "share", "opencode-claude", "debug.log");
+    const logPath = join(process.env.XDG_DATA_HOME!, "opencode-claude", "debug.log");
     if (existsSync(logPath)) unlinkSync(logPath);
 
     const off = spawnSync(
@@ -773,7 +995,25 @@ async function main() {
   }
 
   // Plugin export
-  assert.equal(typeof ClaudeCodePlugin, "function");
+  assert.equal(ClaudeCodePlugin.id, "openchamber.claude-code");
+  assert.equal(typeof ClaudeCodePlugin.setup, "function");
+  {
+    const info: any = buildProviderInfo("http://127.0.0.1:1/v1");
+    assert.equal(info.activation, "enabled");
+    assert.equal(info.package, "@opencode/ai/providers/openai-compatible");
+    assert.equal(info.settings.baseURL, "http://127.0.0.1:1/v1");
+    const listed: any[] = buildClaudeProviderModels(getClaudeModels());
+    const sonnetModel = listed.find((m) => m.id === "claude-sonnet-5");
+    // No input limit on 1M models: OpenCode keeps its own 10% free.
+    const oneM = listed.find((m) => m.limit.context === 1_000_000);
+    assert.equal(oneM?.limit.input, undefined);
+    assert.equal(sonnetModel.limit.input, undefined);
+    assert.deepEqual(
+      sonnetModel.variants.map((v: any) => v.id),
+      buildEffortVariants(getClaudeModels().find((m) => m.id === "claude-sonnet-5")!),
+    );
+    assert.deepEqual(sonnetModel.capabilities.input, ["text", "image", "pdf"]);
+  }
 
   // Auth methods mirror CLI presence: install only when missing, relay only
   // when present, and every path carries the terminal alternative. The method
@@ -781,23 +1021,24 @@ async function main() {
   // method would run a real `npm install -g` — so the terminal fallback is
   // exercised through its pure builder instead.
   {
-    const withoutCli = buildAuthMethods(false, "/tmp");
+    const withoutCli: any[] = buildAuthMethods(false, "/tmp");
     assert.equal(withoutCli.length, 1);
+    assert.equal(withoutCli[0].integrationID, "claude-code");
     assert.equal(
-      withoutCli[0]!.label,
+      withoutCli[0].method.label,
       "Install Claude Code CLI and sign in",
     );
 
-    const withCli = buildAuthMethods(true, "/tmp");
+    const withCli: any[] = buildAuthMethods(true, "/tmp");
     assert.equal(withCli.length, 1);
-    assert.equal(withCli[0]!.label, "Sign in with Claude Code CLI");
+    assert.equal(withCli[0].method.label, "Sign in with Claude Code CLI");
 
     // The fallback instructions always name both the install and the auth
     // command, whatever the launch failure message was.
-    const fallback = manualInstallResponse("boom");
+    const fallback = manualInstallResponse("boom", "claude-cli");
     assert.match(fallback.instructions, /npm install -g @anthropic-ai\/claude-code/);
     assert.match(fallback.instructions, /claude auth login --claudeai/);
-    assert.equal(fallback.method, "auto");
+    assert.equal(fallback.mode, "auto");
   }
 
   const requestHeaders: Record<string, string> = {};
@@ -812,6 +1053,86 @@ async function main() {
   );
   assert.equal(requestHeaders["x-opencode-claude-session"], "ses_test");
   assert.equal(PROVIDER_ID, "claude-code");
+  // Refusal fallback: note in reasoning, OpenCode session follows the model
+  {
+    const { catalogIdForFallback, modelFallbackNote, setModelFallbackHandler, setClaudeQueryStarter, startProxy, getClaudeProxyBaseUrl } =
+      await import("../src/proxy.ts");
+    const { setDiscoveredModels, modelsFromSdk } = await import("../src/models.ts");
+    setDiscoveredModels(modelsFromSdk([
+      { value: "claude-fable-5-1", resolvedModel: "claude-fable-5-1", supportedEffortLevels: ["low", "high"] },
+      { value: "claude-opus-5", resolvedModel: "claude-opus-5", supportedEffortLevels: ["low", "high"] },
+    ]));
+    assert.equal(catalogIdForFallback("claude-opus-5", "claude-fable-5-1[1m]"), "claude-opus-5[1m]");
+    assert.match(
+      modelFallbackNote({ original_model: "claude-fable-5-1", fallback_model: "claude-opus-5", api_refusal_category: "bio" }),
+      /Fable 5\.1 declined this request \(bio\); Opus 5 answered/,
+    );
+    const switched: unknown[] = [];
+    setModelFallbackHandler((...args) => switched.push(args));
+    let chatEnv: Record<string, unknown> | undefined;
+    setClaudeQueryStarter(async (params) => {
+      chatEnv = params.env as Record<string, unknown>;
+      return {
+        stream: (async function* () {
+          yield { type: "system", subtype: "model_refusal_fallback", scope: "session", original_model: "claude-fable-5-1[1m]", fallback_model: "claude-opus-5", api_refusal_category: "bio" };
+          yield { type: "stream_event", event: { type: "content_block_delta", delta: { type: "text_delta", text: "answer from opus" } } };
+          yield { type: "result", is_error: false, usage: {} };
+        })(),
+        interrupt: async () => {},
+        close: () => {},
+        getPid: () => null,
+      };
+    });
+    await startProxy();
+    const res = await fetch(getClaudeProxyBaseUrl() + "/chat/completions", {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-opencode-claude-session": "ses_fallback", "x-opencode-claude-kind": "primary" },
+      body: JSON.stringify({ model: "claude-fable-5-1[1m]", stream: true, messages: [{ role: "user", content: "question" }] }),
+    });
+    const body = await res.text();
+    assert.match(body, /declined this request/);
+    assert.match(body, /answer from opus/);
+    assert.deepEqual(switched, [["ses_fallback", "claude-opus-5[1m]", undefined]]);
+    // Chat turns keep the user's Claude Code memory; only utility turns drop it.
+    assert.equal(chatEnv?.CLAUDE_CODE_DISABLE_AUTO_MEMORY, undefined);
+    setModelFallbackHandler(null);
+    setClaudeQueryStarter(null);
+  }
+
+  // A stopped OpenCode session closes its parked turn right away
+  {
+    const { putBridge, closeSessionBridges, getBridge } = await import("../src/bridge-pool.ts");
+    let closed = false;
+    putBridge({
+      id: "abort-test",
+      conversationKey: "ses_aborted",
+      handle: { stream: (async function* () {})(), close: () => { closed = true; } } as any,
+      pendingTools: new Map(),
+      reportedUsage: new Map(),
+      createdAt: Date.now(),
+    } as any);
+    assert.equal(closeSessionBridges("ses_other"), 0);
+    assert.equal(closeSessionBridges("ses_aborted"), 1);
+    // Leaves the pool at once; the process closes after the stop settles.
+    assert.equal(getBridge("abort-test"), undefined);
+    await new Promise((r) => setTimeout(r, 50));
+    assert.equal(closed, true);
+  }
+
+  // Evicting one OpenCode location must not stop the proxy another still uses
+  {
+    const { acquireProxy, releaseProxy, proxyHolderCount } = await import("../src/proxy.ts");
+    await stopProxy();
+    const first = await acquireProxy();
+    const second = await acquireProxy();
+    assert.equal(first, second, "locations share one proxy");
+    await releaseProxy();
+    assert.equal(proxyHolderCount(), 1);
+    assert.equal(getProxyPort(), first, "still listening for the other location");
+    await releaseProxy();
+    assert.equal(getProxyPort(), null, "last location stops it");
+  }
+
   // Proxy health (without Agent SDK turn)
   await stopProxy();
   const port = await startProxy();
@@ -890,14 +1211,23 @@ async function main() {
       );
       assert.deepEqual(titleOptions!.tools, []);
       assert.deepEqual(titleOptions!.settingSources, []);
+      assert.equal(
+        (titleOptions!.env as Record<string, unknown>).CLAUDE_CODE_DISABLE_AUTO_MEMORY,
+        "1",
+      );
       assert.deepEqual(titleOptions!.skills, []);
       assert.equal(titleOptions!.maxTurns, 1);
+      assert.equal(titleOptions!.model, "claude-haiku-4-5");
+      assert.equal(titleOptions!.effort, undefined);
+      assert.equal(titleOptions!.persistSession, false);
+      assert.equal(titleOptions!.isolateMcp, true);
       assert.equal(titleOptions!.autoCompactEnabled, false);
       assert.deepEqual(titleOptions!.thinking, { type: "disabled" });
       assert.equal(titleOptions!.resume, undefined);
-      assert.equal(
-        titleOptions!.systemPrompt,
-        "You generate short session titles. Follow the requested output format exactly.",
+      // Utility turns get a one-line prompt that names the host
+      assert.match(
+        String(titleOptions!.systemPrompt),
+        /^You are a text generation helper running in OpenCode through the Claude Code harness\./,
       );
       assert.match(String(titleOptions!.prompt), /<request>\nExplain how binary search trees work\n<\/request>/);
     } finally {
@@ -1038,7 +1368,7 @@ async function main() {
       __resetRateLimitNoteDedupe();
 
       // Proxy + mock SDK: successful turn streams text, note, usage — and the
-      // todowrite alias + plan-persistence prompt reach the query starter.
+      // Tool aliases and the tool note reach the query starter.
       __resetRateLimitNoteDedupe();
       let seenParams: Record<string, unknown> | null = null;
       setClaudeQueryStarter(async (params) => {
@@ -1135,16 +1465,22 @@ async function main() {
       assert.match(okReasoning, /99%/);
       assert.equal(okJson.usage?.prompt_tokens, 11);
 
-      // Query starter received the todo alias + plan-persistence append
+      // Query starter received the aliases and the tool note
       assert.ok(seenParams, "query starter params captured");
       assert.equal(seenParams.cwd, "/data/projects/infra");
       const aliases = (seenParams as { toolAliases?: Record<string, string> })
         .toolAliases;
-      assert.equal(aliases?.TodoWrite, "mcp__opencode__todowrite");
+      // OpenCode 2 has no todo tools; no Claude Code todo alias or plan nag.
+      assert.equal(aliases?.TodoWrite, undefined);
       assert.equal(aliases?.todowrite, "mcp__opencode__todowrite");
       const sysPrompt = seenParams.systemPrompt as { append?: string };
-      assert.match(sysPrompt.append ?? "", /mcp__opencode__todowrite/);
+      assert.doesNotMatch(sysPrompt.append ?? "", /todowrite/);
       assert.match(sysPrompt.append ?? "", /[Bb]atch independent tool calls/);
+      assert.match(
+        sysPrompt.append ?? "",
+        /^<runtime_info>In case you're asked: you are running in OpenCode through the Claude Code harness/,
+      );
+      assert.equal((seenParams.systemPrompt as { preset?: string }).preset, "claude_code");
 
       // Proxy + mock SDK: hard limit error BEFORE any content — the proxy
       // must answer with a truthful HTTP 429 (not a fake-200 error stream),
@@ -1379,6 +1715,31 @@ async function main() {
       delete process.env.OPENCODE_CLAUDE_RATE_LIMIT_FAST_FAIL;
       assert.equal(rateLimitGate().blocked, true);
 
+      // A stale limit (reset early): a new message still reaches Claude once,
+      // and an "allowed" event from Claude lifts the gate.
+      setClaudeQueryStarter(async () => ({
+        stream: (async function* () {
+          yield { type: "rate_limit_event", rate_limit_info: { status: "allowed" } };
+          yield { type: "stream_event", event: { type: "content_block_delta", delta: { type: "text_delta", text: "back to work" } } };
+          yield { type: "result", is_error: false, usage: {} };
+        })(),
+        interrupt: async () => {},
+        close: () => {},
+        getPid: () => null,
+      }));
+      const freshMessage = await fetch(`http://127.0.0.1:${port}/v1/chat/completions`, {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-opencode-claude-session": "smoke-mock-mid-run-limit" },
+        body: JSON.stringify({ model: "sonnet", stream: false, messages: [
+          { role: "user", content: "keep working" },
+          { role: "assistant", content: "limited" },
+          { role: "user", content: "limits were reset, go on" },
+        ] }),
+      });
+      assert.equal(freshMessage.status, 200, "a new message is not gated");
+      assert.match(await freshMessage.text(), /back to work/);
+      assert.equal(rateLimitGate().blocked, false, "allowed event lifts the gate");
+
       // Expired hard block self-heals on read
       const { writeFileSync } = await import("node:fs");
       writeFileSync(
@@ -1409,12 +1770,13 @@ async function main() {
       clearForeignSessionId,
       findClaudeSessionFile,
       getForeignSessionId,
+      getSessionLeafUuid,
       setForeignSessionId,
     } = await import("../src/session-store.ts");
     const { mkdirSync, rmSync, writeFileSync, mkdtempSync } = await import(
       "node:fs"
     );
-    const { homedir, tmpdir } = await import("node:os");
+    const { tmpdir } = await import("node:os");
     const { join: joinPath } = await import("node:path");
 
     // Isolate the rate-limit store: this block mocks healthy turns, so a
@@ -1497,8 +1859,7 @@ async function main() {
 
       // 2. Stored binding whose transcript file EXISTS → resume, no injection
       const fakeProjectsDir = joinPath(
-        homedir(),
-        ".claude",
+        process.env.CLAUDE_CONFIG_DIR!,
         "projects",
         "opencode-claude-smoke",
       );
@@ -1516,6 +1877,94 @@ async function main() {
         String(seen2.params!.prompt ?? ""),
         /<conversation_history>/,
       );
+      assert.equal("resumeSessionAt" in seen2.params!, false);
+
+      // 2b. The turn's main-chain entries become the resume point. When
+      //     another claude process appended a branch after it (an orphaned
+      //     turn closed by the TTL reaper), the resume goes through a fork
+      //     cut at it. Subagent entries don't move it.
+      const { setClaudeSessionForker } = await import("../src/proxy.ts");
+      const forks: string[] = [];
+      setClaudeSessionForker(async (id, at) => {
+        forks.push(`${id}@${at}`);
+        writeFileSync(joinPath(fakeProjectsDir, "mock-sess-fork.jsonl"), '{"type":"assistant","uuid":"f1"}\n');
+        return "mock-sess-fork";
+      });
+      setClaudeQueryStarter(async (params) => {
+        seen2.params = params as unknown as Record<string, unknown>;
+        return {
+          stream: (async function* () {
+            yield { type: "system", subtype: "init", session_id: "mock-sess-live" };
+            yield {
+              type: "assistant",
+              uuid: "leaf-main",
+              session_id: "mock-sess-live",
+              parent_tool_use_id: null,
+              message: { content: [] },
+            };
+            yield {
+              type: "assistant",
+              uuid: "leaf-subagent",
+              session_id: "mock-sess-live",
+              parent_tool_use_id: "toolu_sub",
+              message: { content: [] },
+            };
+            yield {
+              type: "stream_event",
+              event: {
+                type: "content_block_delta",
+                delta: { type: "text_delta", text: "MOCK_OK" },
+              },
+            };
+            yield { type: "result", is_error: false, usage: {} };
+          })(),
+          interrupt: async () => {},
+          close: () => {},
+          getPid: () => null,
+        };
+      });
+      await (await postChat("smoke-history-resume", historyMessages)).text();
+      assert.equal(getSessionLeafUuid("smoke-history-resume"), "leaf-main");
+      writeFileSync(
+        joinPath(fakeProjectsDir, "mock-sess-live.jsonl"),
+        '{"type":"assistant","uuid":"leaf-main"}\n{"type":"user","parentUuid":"leaf-main","uuid":"ours"}\n',
+      );
+      mockTurn(seen2, "mock-sess-live");
+      await (await postChat("smoke-history-resume", historyMessages)).text();
+      assert.equal(seen2.params!.resume, "mock-sess-live");
+      assert.deepEqual(forks, [], "a chain that continues from the leaf resumes as is");
+      writeFileSync(
+        joinPath(fakeProjectsDir, "mock-sess-live.jsonl"),
+        '{"type":"assistant","uuid":"leaf-main"}\n{"type":"user","parentUuid":"old-point","uuid":"stale-branch"}\n',
+      );
+      mockTurn(seen2, "mock-sess-fork");
+      await (await postChat("smoke-history-resume", historyMessages)).text();
+      assert.deepEqual(forks, ["mock-sess-live@leaf-main"]);
+      assert.equal(seen2.params!.resume, "mock-sess-fork");
+      assert.equal(getForeignSessionId("smoke-history-resume"), "mock-sess-fork");
+      assert.equal(getSessionLeafUuid("smoke-history-resume"), "f1");
+      // A leaf the file no longer holds falls back to a plain resume.
+      writeFileSync(joinPath(fakeProjectsDir, "mock-sess-live.jsonl"), "{}\n");
+      setForeignSessionId("smoke-history-noleaf", "mock-sess-live", { leafUuid: "gone" });
+      mockTurn(seen2, "mock-sess-live");
+      await (await postChat("smoke-history-noleaf", historyMessages)).text();
+      assert.equal(seen2.params!.resume, "mock-sess-live");
+      assert.equal(forks.length, 1);
+      // A fork that fails transfers the history instead of retrying.
+      writeFileSync(
+        joinPath(fakeProjectsDir, "mock-sess-live.jsonl"),
+        '{"type":"assistant","uuid":"leaf-main"}\n{"type":"user","parentUuid":"old-point","uuid":"stale-branch"}\n',
+      );
+      setForeignSessionId("smoke-history-forkfail", "mock-sess-live", { leafUuid: "leaf-main" });
+      setClaudeSessionForker(async () => {
+        throw new Error("fork failed");
+      });
+      mockTurn(seen2, null);
+      await (await postChat("smoke-history-forkfail", historyMessages)).text();
+      assert.equal(seen2.params!.resume, undefined);
+      assert.match(String(seen2.params!.prompt ?? ""), /<conversation_history>/);
+      assert.equal(getForeignSessionId("smoke-history-forkfail"), undefined);
+      setClaudeSessionForker(null);
       rmSync(fakeProjectsDir, { recursive: true, force: true });
 
       // 3. Stored binding with a MISSING transcript file → binding dropped,
@@ -1632,6 +2081,66 @@ async function main() {
         ((await boomRes.json()) as { error?: { type?: string } }).error?.type,
         "server_error",
       );
+
+      // Anthropic refusal reported as a synthetic assistant message whose
+      // error isn't rate_limit → its 4xx before any stream, not a fake-200
+      // carrying "[claude-code error]" as the answer. (Fork ad13d30.)
+      const refusedText =
+        "API Error: 400 Third-party apps now draw from your extra usage, not your plan limits.";
+      setClaudeQueryStarter(async () => ({
+        stream: (async function* () {
+          yield { type: "system", subtype: "init", session_id: "ff-refused" };
+          yield {
+            type: "assistant",
+            error: "unknown",
+            message: {
+              role: "assistant",
+              content: [{ type: "text", text: refusedText }],
+              usage: { input_tokens: 0, output_tokens: 0 },
+            },
+          };
+          yield { type: "result", is_error: true, result: refusedText };
+          throw new Error(`Claude Code returned an error result: ${refusedText}`);
+        })(),
+        interrupt: async () => {},
+        close: () => {},
+        getPid: () => null,
+      }));
+      for (const stream of [true, false]) {
+        const refusedRes = await postTurn(`ff-refused-${stream}`, stream);
+        assert.equal(refusedRes.status, 400, `stream=${stream}`);
+        const refusedJson = (await refusedRes.json()) as {
+          error?: { type?: string; message?: string };
+        };
+        assert.equal(refusedJson.error?.type, "invalid_request_error");
+        assert.match(refusedJson.error?.message ?? "", /Third-party apps/);
+      }
+      // Transient 4xx (timeout, conflict) stay retryable, not passed through.
+      for (const transient of [408, 409]) {
+        mockDeath(`API Error: ${transient} request timed out or conflicted`);
+        const res = await postTurn(`ff-transient-${transient}`, true);
+        assert.equal(res.status, 500, `API ${transient}`);
+        assert.equal(
+          ((await res.json()) as { error?: { type?: string } }).error?.type,
+          "server_error",
+        );
+      }
+      // max_output_tokens follows a truncated answer: not a failed turn.
+      setClaudeQueryStarter(async () => ({
+        stream: (async function* () {
+          yield { type: "system", subtype: "init", session_id: "ff-maxout" };
+          yield {
+            type: "assistant",
+            error: "max_output_tokens",
+            message: { role: "assistant", content: [{ type: "text", text: "partial" }] },
+          };
+          yield { type: "result", is_error: false, usage: {} };
+        })(),
+        interrupt: async () => {},
+        close: () => {},
+        getPid: () => null,
+      }));
+      assert.equal((await postTurn("ff-maxout", true)).status, 200);
 
       // Error AFTER content → still a 200 stream with the inline note once
       setClaudeQueryStarter(async () => ({
@@ -1844,8 +2353,8 @@ async function main() {
       }
     }
 
-    // CLI resolution is memoized per PATH+HOME: re-probing spawns sync
-    // child processes that hard-block the host's event loop on every query.
+    // CLI resolution is memoized per PATH+HOME: re-probing would spawn
+    // several child processes on every query.
     const binDir = mkdtempSync(joinPath(tmpdir(), "oc-claude-bin-"));
     try {
       const fakeCli = joinPath(binDir, "claude");
@@ -1855,16 +2364,16 @@ async function main() {
       // (~/.local/bin/claude on this dev box) cannot mask a negative result.
       const env = { PATH: binDir, HOME: binDir };
       resetClaudeCliResolutionCache();
-      const first = resolveClaudeCli(env);
+      const first = await resolveClaudeCli(env);
       assert.ok(first && first.endsWith("claude"), "fake CLI resolved");
       unlinkSync(fakeCli);
-      const second = resolveClaudeCli(env);
+      const second = await resolveClaudeCli(env);
       assert.equal(second, first, "resolution must be memoized");
       resetClaudeCliResolutionCache();
       assert.equal(
-        resolveClaudeCli(env),
+        await resolveClaudeCli(env),
         null,
-        "cache reset must re-probe (and negatives stay uncached)",
+        "cache reset must re-probe",
       );
       resetClaudeCliResolutionCache();
     } finally {

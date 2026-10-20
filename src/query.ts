@@ -7,6 +7,7 @@ import { buildClaudeCodeChildEnv } from "./auth-env.js";
 import { isClaudeEffort, type ClaudeEffort } from "./constants.js";
 import {
   assertClaudeWorkingDirectory,
+  isJsEntrypoint,
   resolveClaudeCodeExecutable,
 } from "./executable-path.js";
 import { log } from "./log.js";
@@ -60,6 +61,21 @@ export async function loadClaudeAgentSdk(): Promise<SdkModule> {
       });
   }
   return sdkModulePromise;
+}
+
+/**
+ * Copy a Claude session's chain up to `upToMessageId` into a new session
+ * (fresh uuids, no side branches) and return the new id. A plain resume of
+ * the copy sees exactly that history, wherever other branches went.
+ */
+export async function forkClaudeSession(
+  sessionId: string,
+  upToMessageId: string,
+): Promise<string> {
+  const sdk = await loadClaudeAgentSdk();
+  const result = await sdk.forkSession(sessionId, { upToMessageId });
+  if (!result?.sessionId) throw new Error("forkSession returned no session id");
+  return result.sessionId;
 }
 
 export function resetClaudeAgentSdkCache(): void {
@@ -124,18 +140,156 @@ export type ClaudeQueryHandle = {
   interrupt: () => Promise<void>;
   close: () => void;
   getPid: () => number | null | undefined;
+  /**
+   * Stop the turn the way Claude Code's own Esc does: interrupt, let the CLI
+   * write the interruption to the transcript, then close. Resolves once the
+   * process is closed. Added by withGracefulStop when missing.
+   */
+  stop?: (graceMs?: number) => Promise<void>;
+  /** Observe every event the stream yields, including ones read by stop(). */
+  onEvent?: (listener: (event: unknown) => void) => void;
 };
+
+export type StoppableClaudeQueryHandle = ClaudeQueryHandle & {
+  stop: (graceMs?: number) => Promise<void>;
+  onEvent: (listener: (event: unknown) => void) => void;
+};
+
+/** How long a stopped turn gets to settle after interrupt() before close. */
+export function stopGraceMs(): number {
+  const raw = Number(process.env.OPENCODE_CLAUDE_STOP_GRACE_MS);
+  return Number.isFinite(raw) && raw >= 0 ? raw : 2_000;
+}
+
+/**
+ * Give a query handle a graceful stop().
+ *
+ * close() kills the CLI at once: a turn parked on a tool call dies with its
+ * tool_use unanswered, and a turn killed before its first write leaves a
+ * session id the CLI never saved. stop() first sends the SDK interrupt, so
+ * the CLI aborts the turn itself and records it ("[Request interrupted by
+ * user for tool use]"), reads the stream until the turn's result (nobody
+ * else reads a parked turn), and closes after that or after the grace.
+ *
+ * The stream is wrapped once; its iterator is shared, so events read by
+ * stop() and by the proxy's consumer all pass the onEvent listeners.
+ */
+export function withGracefulStop(handle: ClaudeQueryHandle): StoppableClaudeQueryHandle {
+  if (typeof handle.stop === "function" && typeof handle.onEvent === "function") {
+    return handle as StoppableClaudeQueryHandle;
+  }
+  const inner = handle.stream[Symbol.asyncIterator]();
+  const listeners: Array<(event: unknown) => void> = [];
+  let ended = false;
+  let sawResult = false;
+  const observe = (event: unknown) => {
+    if (event && typeof event === "object" && (event as { type?: unknown }).type === "result") {
+      sawResult = true;
+    }
+    for (const listener of listeners) {
+      try {
+        listener(event);
+      } catch {
+        // a listener must never break the stream
+      }
+    }
+  };
+  const tap: AsyncIterableIterator<unknown> = {
+    async next() {
+      try {
+        const next = await inner.next();
+        if (next.done) ended = true;
+        else observe(next.value);
+        return next;
+      } catch (error) {
+        ended = true;
+        throw error;
+      }
+    },
+    async return(value?: unknown) {
+      ended = true;
+      if (typeof inner.return === "function") return inner.return(value);
+      return { done: true, value: undefined };
+    },
+    [Symbol.asyncIterator]() {
+      return tap;
+    },
+  };
+
+  let closed = false;
+  const close = () => {
+    if (closed) return;
+    closed = true;
+    handle.close();
+  };
+
+  let stopping: Promise<void> | null = null;
+  const stop = (graceMs = stopGraceMs()) => {
+    if (stopping) return stopping;
+    stopping = (async () => {
+      if (!closed && !ended && graceMs > 0) {
+        const settle = (async () => {
+          try {
+            await handle.interrupt();
+          } catch {
+            // process already gone; nothing to settle
+            return;
+          }
+          while (!ended && !sawResult && !closed) {
+            try {
+              if ((await tap.next()).done) break;
+            } catch {
+              break;
+            }
+          }
+        })();
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        await Promise.race([
+          settle,
+          new Promise<void>((resolve) => {
+            timer = setTimeout(resolve, graceMs);
+            timer.unref?.();
+          }),
+        ]);
+        if (timer) clearTimeout(timer);
+      }
+      close();
+    })();
+    return stopping;
+  };
+
+  return {
+    stream: tap,
+    interrupt: handle.interrupt,
+    close,
+    getPid: handle.getPid,
+    stop,
+    onEvent: (listener) => {
+      listeners.push(listener);
+    },
+  };
+}
 
 export type StartClaudeQueryParams = {
   prompt: string | AsyncIterable<unknown>;
   cwd: string;
   model?: string;
   resume?: string;
+  /** With `resume`: resume only up to and including this entry. */
+  resumeSessionAt?: string;
+  /** With `resume`: continue in a new session id instead of appending. */
+  forkSession?: boolean;
   permissionMode?: string;
   effort?: ClaudeEffort | string;
   systemPrompt?:
     | string
-    | { type: "preset"; preset: "claude_code"; append?: string };
+    | {
+        type: "preset";
+        preset: "claude_code";
+        append?: string;
+        /** Move cwd, memory path and git status out of the system prompt. */
+        excludeDynamicSections?: boolean;
+      };
   canUseTool?: (
     toolName: string,
     input: Record<string, unknown>,
@@ -161,6 +315,14 @@ export type StartClaudeQueryParams = {
   autoCompactEnabled?: boolean;
   /** Stop utility queries such as title generation after one model turn. */
   maxTurns?: number;
+  /** false keeps one-shot utility turns out of ~/.claude/projects history. */
+  persistSession?: boolean;
+  /**
+   * Isolate a one-shot turn from every MCP server the user configured,
+   * including claude.ai cloud connectors, so none of their tool definitions
+   * ride along.
+   */
+  isolateMcp?: boolean;
   /** Thinking config; defaults to adaptive when effort is set. */
   thinking?:
     | { type: "adaptive" }
@@ -192,7 +354,7 @@ export async function startClaudeQuery(
   const cwd = assertClaudeWorkingDirectory(params.cwd);
   const pathToClaudeCodeExecutable =
     trimmedString(params.pathToClaudeCodeExecutable) ||
-    resolveClaudeCodeExecutable({ env }) ||
+    (await resolveClaudeCodeExecutable({ env })) ||
     undefined;
 
   const options: Record<string, unknown> = {
@@ -206,13 +368,19 @@ export async function startClaudeQuery(
 
   if (pathToClaudeCodeExecutable) {
     options.pathToClaudeCodeExecutable = pathToClaudeCodeExecutable;
+    if (isJsEntrypoint(pathToClaudeCodeExecutable)) options.executable = "node";
   }
 
   const model = trimmedString(params.model);
   if (model) options.model = model;
 
   const resume = trimmedString(params.resume);
-  if (resume) options.resume = resume;
+  if (resume) {
+    options.resume = resume;
+    const resumeAt = trimmedString(params.resumeSessionAt);
+    if (resumeAt) options.resumeSessionAt = resumeAt;
+    if (params.forkSession === true) options.forkSession = true;
+  }
 
   const permissionMode = trimmedString(params.permissionMode);
   if (ALLOWED_PERMISSION_MODES.has(permissionMode)) {
@@ -239,6 +407,24 @@ export async function startClaudeQuery(
     options.autoCompactEnabled = true;
   }
 
+  if (params.persistSession === false) options.persistSession = false;
+
+  const settings: Record<string, unknown> = {};
+  if (params.isolateMcp === true) {
+    options.strictMcpConfig = true;
+    settings.disableClaudeAiConnectors = true;
+  }
+
+  // Without these the CLI streams thinking blocks empty: the UI shows nothing
+  // for as long as Claude thinks (tens of seconds), then the answer lands at
+  // once. Summaries stream the reasoning as it happens (same as t3code).
+  if ((options.thinking as { type?: string } | undefined)?.type !== "disabled") {
+    settings.showThinkingSummaries = true;
+    options.extraArgs = { "thinking-display": "summarized" };
+  }
+
+  if (Object.keys(settings).length > 0) options.settings = settings;
+
   if (Number.isInteger(params.maxTurns) && Number(params.maxTurns) > 0) {
     options.maxTurns = params.maxTurns;
   }
@@ -262,9 +448,13 @@ export async function startClaudeQuery(
       type: "preset";
       preset: "claude_code";
       append?: string;
+      excludeDynamicSections?: boolean;
     } = { type: "preset", preset: "claude_code" };
     const append = trimmedString(presetSystemPrompt.append);
     if (append) systemPrompt.append = append;
+    if (presetSystemPrompt.excludeDynamicSections === true) {
+      systemPrompt.excludeDynamicSections = true;
+    }
     options.systemPrompt = systemPrompt;
   } else {
     options.systemPrompt = { type: "preset", preset: "claude_code" };
@@ -335,21 +525,28 @@ export async function startClaudeQuery(
       ? (result.pid as number | null | undefined)
       : null;
 
+  // Query.interrupt() is a control request: it rejects once the process is
+  // gone, which callers treat as "nothing left to interrupt".
   const interrupt = async () => {
     if (result && typeof result.interrupt === "function") {
-      try {
-        await result.interrupt();
-      } catch {
-        // fall through to tree-kill
-      }
+      await result.interrupt();
     }
-    killProcessTree(getPid(), { signal: "SIGTERM" });
   };
 
   const close = () => {
     if (closed) return;
     closed = true;
     killProcessTree(getPid(), { signal: "SIGTERM", force: true });
+    // The SDK Query exposes no pid, so the tree-kill above is a no-op for it;
+    // Query.close() is what actually ends the CLI subprocess. A parked turn
+    // is not being iterated, and return() alone leaves its child running.
+    if (result && typeof result.close === "function") {
+      try {
+        result.close();
+      } catch {
+        // already torn down
+      }
+    }
     if (result && typeof result.return === "function") {
       try {
         Promise.resolve(result.return()).catch(() => {});
@@ -359,5 +556,58 @@ export async function startClaudeQuery(
     }
   };
 
-  return { stream: result as AsyncIterable<unknown>, interrupt, close, getPid };
+  return withGracefulStop({
+    stream: result as AsyncIterable<unknown>,
+    interrupt,
+    close,
+    getPid,
+  });
+}
+
+/**
+ * Ask the local CLI which models this account can use. Starts a Claude Code
+ * process with no prompt: no model call is made and nothing is persisted.
+ */
+export async function listClaudeSupportedModels(
+  timeoutMs = 20_000,
+): Promise<unknown[] | null> {
+  const sdk = await loadClaudeAgentSdk();
+  const queryFn = (sdk as { query?: Function }).query;
+  if (typeof queryFn !== "function") return null;
+  let release: () => void = () => {};
+  const idle = (async function* () {
+    await new Promise<void>((resolve) => {
+      release = resolve;
+    });
+  })();
+  const env = buildClaudeCodeChildEnv(process.env);
+  const pathToClaudeCodeExecutable = await resolveClaudeCodeExecutable({ env });
+  const q = queryFn({
+    prompt: idle,
+    options: {
+      env,
+      persistSession: false,
+      settingSources: [],
+      strictMcpConfig: true,
+      settings: { disableClaudeAiConnectors: true },
+      ...(pathToClaudeCodeExecutable ? { pathToClaudeCodeExecutable } : {}),
+      ...(pathToClaudeCodeExecutable && isJsEntrypoint(pathToClaudeCodeExecutable)
+        ? { executable: "node" as const }
+        : {}),
+    },
+  }) as { supportedModels?: () => Promise<unknown[]>; close?: () => void };
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    if (typeof q.supportedModels !== "function") return null;
+    return await Promise.race([
+      q.supportedModels(),
+      new Promise<null>((resolve) => {
+        timer = setTimeout(() => resolve(null), timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+    release();
+    q.close?.();
+  }
 }

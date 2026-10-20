@@ -1,13 +1,328 @@
 # Changelog
 
-## Unreleased
+## 1.4.2 - 2026-10-18
 
-- **Sonnet 5.5**: the `sonnet` alias now tracks the current Sonnet generation and is
-  displayed as **Sonnet 5.5**; the previous generation stays selectable as a
-  pinned **Sonnet 5** (`claude-sonnet-5`).
-- **Opus 5.5**: the `opus` alias now tracks the current Opus generation and is
-  displayed as **Opus 5.5**; the previous generation stays selectable as a
-  pinned **Opus 5** (`claude-opus-5`) alongside the existing pinned models.
+- **Claude sees OpenChamber's session context**: OpenChamber's guidance,
+  pinned notes, memory and checkout details never reached Claude, so it
+  didn't link the issues and PRs it worked on to the session. It now gets
+  them like any other model.
+- **Full tool instructions**: Claude Code cut tool descriptions at 2048
+  characters, so long OpenChamber tools lost their last rules and drawn
+  pages ignored the chat theme. The limit is now 8192. Thanks to
+  @yulia-ivashko.
+- **Fix: compaction loop with another provider's summarizer**: when a chat
+  was compacted by a non-Claude model, Claude kept going with the old
+  history and the chat compacted again and again. Thanks to @mradwankhalil.
+- **Sonnet 5 and 5.5 have their full 1M window**: they were listed at 200K
+  and compacted early. The separate "(1M)" entries are gone, so pick the
+  model again in sessions that used them. Thanks to @android6.
+
+## 1.4.1 - 2026-10-13
+
+- **Opus 5.5's update before a tool call shows as text**: the short "found
+  X, now checking Y" note often landed in the Thinking panel. It now shows
+  as a message. Thanks to @JosueGalRe.
+- **Fix: compaction told Claude you had rejected its tool calls**: when
+  OpenCode compacted a chat mid-turn, the summary said the user rejected the
+  pending calls and interrupted, so Claude stopped and asked for permission
+  again. The summary now knows the plugin stopped the turn, and gets the
+  results OpenCode already has. Thanks to @sporez.
+- **Fix: parallel generate calls cancelled each other**: plugins running
+  several `generate.text` calls at once with the same instructions got
+  "ended the turn without any output" on all but one. Thanks to @sporez.
+- **Fewer "Model unavailable" errors on OpenCode v2 reloads**: the Claude
+  models are back in the catalog right away instead of after the CLI
+  check, and locations share one check. Thanks to @mradwankhalil.
+- **Works as root**: chats with tools no longer fail on a root-only VPS.
+  Thanks to @a-johanes.
+- **Haiku 5.5 has its full 1M window**: it was listed at 200K and compacted
+  early. Thanks to @aaa1124.
+
+## 1.4.0 - 2026-10-11
+
+- **Windows support**: on Windows with an npm-installed Claude Code, the
+  plugin handed the Agent SDK `claude.cmd`, which it can't start, so models
+  and chat failed with EINVAL. The plugin now uses the native `claude.exe`
+  npm installs beside it, and runs older installs that only have `cli.js`
+  through node. Thanks to @daveotero and @StephenHnilica.
+- **Fix: 1M chats compacted at 81%**: the plugin's 900k input limit stacked
+  with the 10% OpenCode keeps free since 2.0.19, so 1M chats compacted
+  around 810k. OpenCode's own reserve now gives the intended 90%. Thanks to
+  @android6.
+- **Sonnet 5.5 is listed before the CLI reports its models**: on a first
+  start or while signed out, a session on Sonnet 5.5 no longer asks you to
+  pick a model again. Thanks to @fgbm.
+- **Tool results in transferred history name their tool**: when Claude gets
+  the chat as text (a new session, turns another model answered), each
+  result says which tool it came from instead of an opaque call id. Thanks
+  to @fgbm.
+
+## 1.3.9 - 2026-10-11
+
+- **Fix: signing back in asked for a needless restart**: when Claude Code
+  lost its login, the error in chat said to run `claude auth login` and then
+  restart OpenCode. Each turn starts Claude Code again and reads the login
+  fresh, so the restart is not needed. The message now says to sign in from a
+  terminal and send the message again.
+
+## 1.3.8 - 2026-10-07
+
+- **New sessions start from the prompt cache**: Claude Code's system prompt
+  carried the working directory, memory path and git status, so every new
+  chat and every subagent wrote all of it to the cache again. Those details
+  now go in the first message instead, and a new session reads the prompt
+  from the cache. Already open chats rewrite their cache once after the
+  update. `OPENCODE_CLAUDE_DYNAMIC_SECTIONS=keep` restores the old layout.
+  Thanks to @fgbm.
+- **Fix: long chats compacted too early**: when one turn made several calls
+  inside Claude Code, the plugin added up their prompts, and OpenCode read
+  the sum as the context size. A 1M chat at 500k could compact right away.
+  Now the context size is the last call's prompt. Thanks to @android6.
+- **Fix: instructions imported into CLAUDE.md arrived twice**: when a
+  CLAUDE.md pulled in a file with `@path` (for example the global
+  `~/.config/opencode/AGENTS.md`), Claude Code loaded it and the plugin sent
+  it again. Imported files now count as already loaded. Thanks to
+  @android6.
+
+## 1.3.7 - 2026-10-05
+
+- **Fix: Claude missed what another model said in the same chat**: if you
+  switched a chat to another model for a few turns and then back to Claude,
+  Claude continued from its own last turn and never saw those turns. It
+  could answer an older question or do the wrong task. Now Claude gets the
+  turns it missed along with your new message.
+
+## 1.3.6 - 2026-10-05
+
+- **Fix: session titles named an unrelated project**: Claude Code adds your
+  saved memory notes to every request, including the one that names a new
+  session, so a title could pick up a project from those notes instead of
+  your message. Titles and text-only summaries now run without the notes.
+  Chat turns, and summaries that continue the chat's Claude session, keep
+  them.
+
+## 1.3.5 - 2026-10-05
+
+- **Compaction summaries cover the whole chat**: summaries used to be written
+  by Haiku from a text copy cut to 400k characters, with every tool result
+  cut to 1000, so on long chats they missed most of the conversation. Now
+  the chat's own model writes them from its Claude session, with full tool
+  results and most of it from the prompt cache. The session itself isn't
+  changed.
+- **Fix: Claude stopped working after a plugin reload**: when OpenCode
+  reloaded the plugin (a rebuild, a config change, an idle project closing)
+  while a command was running, Claude saw the call as rejected by the user
+  and stopped. The turn now waits for the result as usual. If a turn does
+  get cut off, Claude is told it was the plugin, not you.
+
+## 1.3.4 - 2026-10-01
+
+- **Skills work again**: Claude gets OpenCode's skills list (from `.claude`,
+  `.agents` and `.opencode`) and loads skills through OpenCode's skill tool.
+- **Custom agents keep their role**: a custom agent's own prompt, like a
+  `writer` subagent's rules, now reaches Claude as that session's role.
+  OpenCode's built-in agents still run on Claude Code's prompt alone.
+- **MCP server notes and OpenCode-only instructions**: what MCP servers say
+  about their tools, and instruction files only OpenCode reads (the global
+  `~/.config/opencode/AGENTS.md`, files in `instructions`) are passed on. A
+  project's `AGENTS.md` is left to Claude Code, which reads it where there
+  is no `CLAUDE.md`.
+- The runtime note no longer repeats the model and effort; Claude Code's
+  prompt already names the model.
+
+## 1.3.3 - 2026-10-01
+
+- **Fix: Claude got more of OpenCode's system prompt than intended**: since
+  OpenCode 2.0.19 the Code Mode tool catalog comes first in its system
+  prompt, and the plugin forwarded everything after it too (MCP guidance,
+  skills, date, environment, project instructions). Now only the tool
+  catalog reaches Claude. Thanks to @langfeld.
+
+## 1.3.2 - 2026-10-01
+
+- **Fix: "No message found with message.uuid" on every message**: when a
+  Claude session had a side branch, resuming it from the chat's last turn
+  failed and the chat got stuck in retries. The plugin now resumes such
+  sessions, and reverted chats, through a fork of the session cut at the
+  right turn. Stuck chats recover on their next message.
+- **Deep reverts keep the session**: reverting past earlier forks resumes
+  from the session that holds that turn instead of resending the history
+  as text.
+
+## 1.3.1 - 2026-09-30
+
+- **Fix: compaction loop**: when OpenCode compacted a chat while Claude was
+  waiting on a tool, the old turn kept answering the compacted chat with its
+  old context size, and OpenCode compacted again and again. Compaction now
+  stops that turn first, and the chat continues on the compacted history.
+
+## 1.3.0 - 2026-09-30
+
+- **Claude no longer forgets part of a chat**: after an OpenCode restart, a
+  leftover `claude` process could write into the same Claude session and
+  fork it, and the next message resumed the wrong branch. The plugin now
+  remembers where its conversation ends and resumes exactly there, stops an
+  earlier turn properly before starting the next one, and never runs two
+  processes on one session.
+- **Revert and edit reach Claude**: after reverting or editing a message in
+  OpenCode, Claude continues from that point instead of remembering the
+  undone turns. If an old message changed, the history is sent as text.
+- **Real error messages**: failed turns show Claude Code's actual reason
+  instead of "Claude turn failed". A chat that outgrew the context window
+  makes OpenCode compact instead of retrying the same request, image errors
+  aren't retried, and refusals say why.
+- **Truncated answers look truncated**: a reply cut at the token limit ends
+  as `length`, a refusal as `content_filter`, not as a normal finish.
+- **Overload and retries are visible**: Claude Code's retries show up in
+  the reasoning, long retry pauses no longer kill the turn, and an overload
+  reported as an empty success becomes a 503 that OpenCode retries.
+- **Extra usage errors aren't retried**: when Anthropic answers "Third-party
+  apps now draw from extra usage", you see it once instead of a retry loop.
+- **Tools named after the app**: under OpenChamber the tools are
+  `mcp__openchamber__*` and Claude is told it runs in OpenChamber; in plain
+  OpenCode both say OpenCode.
+- Removed the leftover todo tool aliases and plan prompt from OpenCode 1.x,
+  and the session store is written only when something changes.
+
+## 1.2.3 - 2026-09-27
+
+- **Fix: Claude didn't know about MCP and OpenChamber tools**: OpenCode 2.x
+  reaches MCP servers, OpenChamber's tools and the browser through its
+  `execute` tool, and lists them in a Code Mode section of its own system
+  prompt, which the plugin doesn't forward. Claude only saw a bare `execute`
+  and had to guess. That one section, the tool catalog, now reaches Claude;
+  the rest of OpenCode's prompt still doesn't.
+
+## 1.2.2 - 2026-09-27
+
+- **Fix: "Retrying" after limits were reset**: the plugin kept blocking turns
+  until the old reset time, even after Claude reported the limit open again
+  or the user reset their limits early. An "allowed" update from Claude now
+  lifts the block, and every new message is checked with Claude once;
+  OpenCode's automatic retries of the same request still wait.
+- **Stopping a session stops Claude**: aborting while a tool runs now closes
+  the turn and its `claude` process right away instead of after an hour.
+- **Model switches after a refusal are visible**: when Claude Code retries a
+  refused request on another model (Fable → Opus), a note appears in the
+  reasoning and the OpenCode session moves to the model that is answering.
+- **Earlier compaction on 1M models**: they declare a 900k input limit, so
+  OpenCode compacts around 90% instead of at the very edge.
+- **Clear error when tools can't load**: a turn whose OpenCode tools failed
+  to load now fails with a message instead of running without tools.
+
+Thanks to @samiralibabic, @MTEKode, @mradwankhalil and @android6, whose PRs
+and issues pointed at these.
+
+## 1.2.1 - 2026-09-27
+
+- **Fix: parallel tool calls mostly ran one by one**: Claude Code starts a
+  message's tool calls only after the message ends, microseconds apart, and
+  the plugin handed off the first call before the rest had started. About two
+  of three read/grep/subagent groups were split into separate steps. The
+  plugin now waits for the whole group Claude announced (at most 300 ms), so
+  they reach OpenCode together.
+
+## 1.2.0 - 2026-09-27
+
+- **Fix: one idle project cut off turns in the others**: OpenCode closes idle
+  projects every few minutes, and each close stopped the proxy that every
+  project shares. Running turns elsewhere were cut mid-work and rebuilt, and
+  now and then failed outright. The proxy now stays up while any project
+  uses it.
+- **Thinking shows up while Claude thinks**: Claude Code streamed empty
+  thinking blocks, so the chat stayed silent for as long as Claude reasoned
+  and then the answer landed at once. Thinking summaries now stream into the
+  reasoning block, same as in t3code.
+- The model list is refreshed from the CLI at most every ten minutes instead
+  of on every plugin start.
+
+## 1.1.1 - 2026-09-26
+
+- **Fix: phantom "attachments" while tools run**: OpenCode 2.x sends images a
+  tool returns (screenshots, `read` on a PNG) as a text-less message right
+  after the tool result. The plugin took it for a message from the user, so
+  Claude was told "the user sent attachments" that never arrived. That media
+  now counts as part of the tool result.
+
+## 1.1.0 - 2026-09-26
+
+Several fixes in this release were found and first built by Bryan Galdámez
+([@JosueGalRe](https://github.com/JosueGalRe)) in his fork; thanks!
+
+- **Fix: messages before your prompt were dropped**: only the newest user
+  message reached Claude, so OpenChamber's inline comments, queued messages
+  and OpenCode's Plan-mode reminder were lost. Every user message since the
+  last reply now reaches Claude, and messages typed while a tool runs arrive
+  with its result.
+- **Tool results with images and PDFs**: a screenshot or PDF read by a tool now
+  reaches Claude instead of a text placeholder.
+- **Parallel tool calls**: all tool calls of one Claude reply go to OpenCode at
+  once (reads, subagents), instead of one round trip each. Fewer steps also
+  means fewer re-reads of the whole context.
+- **Subagents stay visible**: the subagent list moves to the front of the task
+  tool description, which Claude Code truncates at 2048 characters.
+- **Refusals are real errors**: an API refusal before any output is answered
+  with its HTTP status and message instead of a 200 with error text.
+- **Rate-limit resets**: weekly/dated ("resets Oct 6, 1pm") and hours-only
+  resets are parsed, and a limit message without a reset time no longer reuses
+  another window's reset (which could block turns for days).
+- **No blocking CLI probes**: `claude auth status` and CLI lookups run async,
+  so they no longer stall the OpenCode server.
+- **Abandoned turns are reaped**: a turn parked on tool calls that never get
+  answered is closed after an hour (`OPENCODE_CLAUDE_PARKED_TURN_TTL_MS`),
+  and closing a turn now really stops its `claude` process.
+- **Security: Claude Code's built-in tools are never enabled**: a turn that
+  arrived without OpenCode tools used to get Bash/Edit auto-approved, bypassing
+  OpenCode permissions. It now gets no tools.
+- **Prompts, t3code-style**: chat turns keep Claude Code's system prompt and
+  append a short note that Claude is running in OpenChamber through the
+  Claude Code harness. Titles, summaries and generate use a one-line system
+  prompt with the task in the user message (~15x smaller than before).
+- **Stable model ids and honest names**: models are listed under their
+  concrete ids (`claude-opus-5-5[1m]`, `claude-sonnet-5`…), like t3code, so a
+  session no longer moves to a new model when the CLI's `opus` alias does.
+  Names come from the id ("Opus 5.5"), not the CLI's version-dependent label.
+  Sessions that picked a 1.0.0 alias (`opus[1m]`, `sonnet`, `haiku`) need a
+  model picked once.
+- **Clearer usage log**: `turn usage` shows steps, context per step, and totals.
+
+## 1.0.0 - 2026-09-25
+
+Requires OpenCode 2.x. OpenCode 1.x users stay on 0.14.
+
+- **OpenCode 2.x plugin API**: the provider, its models, the sign-in button
+  and request headers are registered through the v2 `{ id, setup }` API. No
+  provider block is needed in `opencode.json`; register the plugin under
+  `plugins`. `{ "options": { "debug": true } }` turns on the debug log.
+- **Model list from Claude Code itself**: models come from the CLI's
+  `supportedModels()` for the signed-in account (Opus 5.5, Fable 5.1, Sonnet 5,
+  Opus 4.x, Haiku…), cached for the next start. 1M context variants follow the
+  same per-family rules as t3code, and effort variants only appear where the
+  model accepts them. Ids from earlier versions keep working.
+- **Fix: tools lost their parameters**: tool schemas went through a lossy
+  JSON Schema → zod conversion, so Claude saw no parameter descriptions, no
+  nested fields and no enums, and unknown arguments were dropped. OpenCode's
+  schemas now reach Claude verbatim and arguments reach OpenCode intact.
+- **Fix: output tokens were undercounted**: usage came from the opening
+  snapshot of each API call (output ≈ 1-4 tokens); the final `message_delta`
+  count now wins, and thinking tokens are reported separately. Turn stats in
+  OpenCode/OpenChamber now show real numbers.
+- **Plan-only**: turns are refused when the CLI is signed in with an API key
+  or routed to Bedrock/Vertex/Foundry; API keys belong to OpenCode's built-in
+  Anthropic provider.
+- **Less quota per turn**: chat turns get only OpenCode's tools — the user's
+  Claude Code MCP servers and claude.ai connectors are no longer attached.
+  Titles and compaction summaries run on Haiku, isolated and unsaved, and a
+  compaction starts a fresh Claude session from the compacted history.
+- **Stateless generation**: `/api/experimental/generate` requests (no session)
+  run as one clean turn: no tools, no user context, nothing persisted.
+- **No stray sessions**: title/summary/generate turns no longer land in the
+  Claude Code history (`claude --resume`).
+- **Security: loopback proxy refuses browser requests**: requests carrying an
+  `Origin` header or a non-loopback `Host` get 403, so a web page cannot spend
+  the subscription through CSRF or DNS rebinding.
+- Per-run token usage (`turn usage`) is written to the debug log.
+- README no longer implies Anthropic endorsement.
 
 ## 0.13.1 - 2026-08-18
 

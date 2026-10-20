@@ -7,14 +7,16 @@
  * 3. Native effort variants, session resume, tools, skills, and MCP
  *
  * Register in opencode.json:
- *   { "plugin": ["@openchamber/opencode-claude"] }
+ *   { "plugins": ["@openchamber/opencode-claude"] }
  */
-import type { Hooks, Plugin, PluginInput } from "@opencode-ai/plugin";
+// Type-only: the v2 host loads a plain `{ id, setup }` object, so the plugin
+// needs none of OpenCode's runtime packages.
+import type { Model, Plugin, Provider } from "@opencode/plugin";
 import {
-  DEFAULT_MODEL_ID,
   DIRECTORY_HEADER,
   EFFORT_HEADER,
-  OPENAI_COMPATIBLE_NPM,
+  KIND_HEADER,
+  OPENAI_COMPATIBLE_PACKAGE,
   PROVIDER_ID,
 } from "./constants.js";
 import { detectClaudeCode } from "./detect.js";
@@ -29,24 +31,22 @@ import {
   resolveClaudeModelSelection,
 } from "./model-selection.js";
 import {
-  buildConfigVariants,
   buildEffortVariants,
   getClaudeModels,
+  modelsFromSdk,
+  setDiscoveredModels,
   type ClaudeModel,
+  type SdkModelRow,
 } from "./models.js";
+import { listClaudeSupportedModels } from "./query.js";
+import { closeSessionBridges } from "./bridge-pool.js";
 import {
   getClaudeProxyBaseUrl,
-  getProxyPort,
+  acquireProxy,
+  releaseProxy,
+  setModelFallbackHandler,
   startProxy,
 } from "./proxy.js";
-
-function zeroCost() {
-  return {
-    input: 0,
-    output: 0,
-    cache: { read: 0, write: 0 },
-  };
-}
 
 export function applyClaudeRequestContextHeaders(
   headers: Record<string, string>,
@@ -57,255 +57,248 @@ export function applyClaudeRequestContextHeaders(
   if (sessionID) headers["x-opencode-claude-session"] = sessionID;
 }
 
-function buildProviderModel(
-  model: ClaudeModel,
-  id: string,
-  baseURL: string,
-): Record<string, unknown> {
-  const variants = buildEffortVariants(model);
-  const hasEffort = Object.values(variants).some(
-    (v) => v && typeof v === "object" && "effort" in v,
-  );
+type ProviderInfo = Provider.Info;
+type ModelInfo = Model.Info;
+type IntegrationEditor = Parameters<
+  Parameters<Plugin.Context["integration"]["transform"]>[0]
+>[0];
+type AuthRegistration = Parameters<IntegrationEditor["method"]["update"]>[0];
+
+export function buildProviderModel(model: ClaudeModel, id: string): ModelInfo {
   return {
     id,
+    modelID: id,
     providerID: PROVIDER_ID,
-    api: {
-      id,
-      url: baseURL,
-      npm: OPENAI_COMPATIBLE_NPM,
-    },
-    name: id === DEFAULT_MODEL_ID && model.id !== DEFAULT_MODEL_ID
-      ? `Default (${model.name})`
-      : model.name,
-    capabilities: {
-      temperature: true,
-      // Runtime models expose reasoning so streams can carry thinking deltas.
-      reasoning: hasEffort,
-      attachment: true,
-      toolcall: true,
-      input: {
-        text: true,
-        audio: false,
-        image: true,
-        video: false,
-        pdf: true,
-      },
-      output: {
-        text: true,
-        audio: false,
-        image: false,
-        video: false,
-        pdf: false,
-      },
-      interleaved: true,
-    },
-    // OpenCode derives capabilities.input from modalities.input — include
-    // "pdf" or PDFs are replaced with unsupported-modality errors.
-    modalities: {
-      input: ["text", "image", "pdf"],
-      output: ["text"],
-    },
-    cost: zeroCost(),
-    limit: {
-      context: model.contextWindow,
-      output: model.maxTokens,
-    },
-    status: "active",
-    options: {
-      includeUsage: true,
-    },
-    headers: {},
-    release_date: "",
-    variants,
-  };
-}
-
-function buildConfigModelEntry(model: ClaudeModel): Record<string, unknown> {
-  const variants = buildConfigVariants(model);
-  return {
     name: model.name,
-    // Keep config non-reasoning so OpenCode does not prepend generic
-    // low/medium/high ahead of our explicit effort map (cursor pattern).
-    reasoning: false,
-    tool_call: true,
-    // OpenCode config merge sets capabilities.input from modalities.input.
-    // Missing "image"/"pdf" strips attachments before they reach the proxy.
-    attachment: true,
-    modalities: {
-      input: ["text", "image", "pdf"],
-      output: ["text"],
-    },
     capabilities: {
       tools: true,
       input: ["text", "image", "pdf"],
       output: ["text"],
     },
+    // Effort travels in a header set by the model.request hook, so variants
+    // carry no settings and OpenCode never sends reasoning_effort itself.
+    variants: buildEffortVariants(model).map((effort) => ({ id: effort })),
+    time: { released: 0 },
+    cost: [],
+    status: "active",
+    enabled: true,
     limit: {
       context: model.contextWindow,
+      // No input limit: OpenCode 2.0.19+ keeps 10% of the window free on
+      // its own (compaction.buffer overrides it). A 900k input on top of
+      // that compacted 1M chats at 81%, not the intended 90%.
       output: model.maxTokens,
     },
-    options: {
-      includeUsage: true,
-    },
-    variants,
-  };
+  } as unknown as ModelInfo;
 }
 
-function buildClaudeProviderModels(
-  models: ClaudeModel[],
-): Record<string, unknown> {
-  const baseURL = getClaudeProxyBaseUrl();
-  const providerModels = Object.fromEntries(
-    models.map((model) => [model.id, buildProviderModel(model, model.id, baseURL)]),
-  );
-  const defaultModel =
-    models.find((m) => m.id === DEFAULT_MODEL_ID) || models[0];
-  if (defaultModel && !(DEFAULT_MODEL_ID in providerModels)) {
-    providerModels[DEFAULT_MODEL_ID] = buildProviderModel(
-      defaultModel,
-      DEFAULT_MODEL_ID,
+export function buildClaudeProviderModels(models: ClaudeModel[]): ModelInfo[] {
+  return models.map((model) => buildProviderModel(model, model.id));
+}
+
+export function buildProviderInfo(baseURL: string): ProviderInfo {
+  return {
+    id: PROVIDER_ID,
+    name: "Claude Code",
+    // Availability follows the local CLI login, not an OpenCode credential:
+    // the integration below is only the sign-in button.
+    activation: "enabled",
+    package: OPENAI_COMPATIBLE_PACKAGE,
+    settings: {
       baseURL,
+      provider: PROVIDER_ID,
+      apiKey: "claude-code-proxy",
+    },
+  } as unknown as ProviderInfo;
+}
+
+// OpenCode starts a plugin instance per location and recycles idle ones, so
+// setup runs many times a day; the account's model list rarely changes.
+const MODEL_REFRESH_INTERVAL_MS = 10 * 60_000;
+let lastModelRefresh = 0;
+
+async function refreshModelCatalog(reload: () => Promise<void>) {
+  const now = Date.now();
+  if (now - lastModelRefresh < MODEL_REFRESH_INTERVAL_MS) return;
+  lastModelRefresh = now;
+  try {
+    const rows = await listClaudeSupportedModels();
+    if (!rows?.length) return;
+    if (setDiscoveredModels(modelsFromSdk(rows as SdkModelRow[]))) {
+      await reload();
+    }
+  } catch (err) {
+    log.warn(
+      "[opencode-claude] could not read the model list from Claude Code",
+      err instanceof Error ? err.message : err,
     );
   }
-  return providerModels;
-}
-
-function ensureClaudeProviderConfig(
-  config: Record<string, any>,
-  models: ClaudeModel[],
-): void {
-  if (!config.provider || typeof config.provider !== "object") {
-    config.provider = {};
-  }
-  const existing = config.provider[PROVIDER_ID] ?? {};
-  const existingOptions =
-    existing.options && typeof existing.options === "object"
-      ? existing.options
-      : {};
-  const existingModels =
-    existing.models && typeof existing.models === "object"
-      ? existing.models
-      : {};
-
-  const port = getProxyPort();
-  const baseURL = port ? `http://127.0.0.1:${port}/v1` : undefined;
-  const seededModels = Object.fromEntries(
-    models.map((model) => [model.id, buildConfigModelEntry(model)]),
-  );
-  const defaultModel =
-    models.find((m) => m.id === DEFAULT_MODEL_ID) || models[0];
-  if (defaultModel && !(DEFAULT_MODEL_ID in seededModels)) {
-    seededModels[DEFAULT_MODEL_ID] = {
-      ...buildConfigModelEntry(defaultModel),
-      name: `Default (${defaultModel.name})`,
-    };
-  }
-
-  config.provider[PROVIDER_ID] = {
-    ...existing,
-    name:
-      typeof existing.name === "string" && existing.name.trim()
-        ? existing.name
-        : "Claude Code",
-    npm: existing.npm ?? OPENAI_COMPATIBLE_NPM,
-    options: {
-      apiKey: "claude-code-proxy",
-      includeUsage: true,
-      ...existingOptions,
-      // Live listener URL must win over any stale pinned baseURL in user config.
-      ...(baseURL ? { baseURL } : {}),
-    },
-    // Seeded catalog first; user-declared model entries win.
-    models: {
-      ...seededModels,
-      ...existingModels,
-    },
-  };
-}
-
-async function loadClaudeRuntime(
-  provider?: { models?: Record<string, unknown> },
-): Promise<{ port: number; providerModels: Record<string, unknown> } | undefined> {
-  const port = await startProxy();
-
-  const providerModels = buildClaudeProviderModels(getClaudeModels());
-  if (provider) provider.models = providerModels;
-  return { port, providerModels };
 }
 
 /**
- * OpenCode plugin that provides Claude Code authentication and model access.
+ * Close a session's parked turn as soon as OpenCode stops the session. A turn
+ * parked on tool calls has no open HTTP request, so an abort never reaches the
+ * proxy otherwise and the claude process lingered until the TTL reaper.
+ */
+function watchSessionInterrupts(ctx: Plugin.Context): () => void {
+  const controller = new AbortController();
+  void (async () => {
+    try {
+      for await (const event of ctx.event.subscribe({ signal: controller.signal })) {
+        const e = event as { type?: string; data?: { sessionID?: string } };
+        if (
+          (e.type === "session.execution.interrupted" || e.type === "session.execution.failed") &&
+          e.data?.sessionID
+        ) {
+          const closed = closeSessionBridges(e.data.sessionID);
+          if (closed) {
+            log.info("[opencode-claude] closed the parked turn of a stopped session", {
+              sessionID: e.data.sessionID,
+            });
+          }
+        }
+      }
+    } catch (err) {
+      if (!controller.signal.aborted) {
+        log.warn(
+          "[opencode-claude] session event stream ended",
+          err instanceof Error ? err.message : err,
+        );
+      }
+    }
+  })();
+  return () => controller.abort();
+}
+
+/** Registration-time URL; model.request replaces it with the live one. */
+function currentProxyBaseUrl(): string {
+  try {
+    return getClaudeProxyBaseUrl();
+  } catch {
+    return "http://127.0.0.1:0/v1";
+  }
+}
+
+/**
+ * OpenCode v2 plugin that provides Claude Code authentication and model access.
  *
  * The auth methods are chosen once at load from the CLI's presence: a host
  * with `claude` gets the sign-in relay, a host without it gets the install
  * action. `authorize` re-detects at run time, so the install action still
  * relays the sign-in right after a successful install.
  */
-export const ClaudeCodePlugin: Plugin = async (
-  input: PluginInput,
-): Promise<Hooks> => {
-  const cliPresent = await probeCliPresence();
-  return {
-    async config(config) {
-      // Bind first (ephemeral port by default), then seed provider baseURL so
-      // OpenCode's static config matches the live listener for this process.
-      try {
+export const ClaudeCodePlugin: Plugin.Plugin = {
+  id: "openchamber.claude-code",
+  async setup(ctx) {
+    // `{ "package": "...", "options": { "debug": true } }` in opencode.json
+    // turns on the durable debug log without touching the server's env.
+    if ((ctx.options as { debug?: unknown } | undefined)?.debug === true) {
+      process.env.OPENCODE_CLAUDE_DEBUG ??= "1";
+    }
+    const directory = ctx.location.directory;
+    // Bind first (ephemeral port by default) so the provider points at the
+    // live listener for this process.
+    try {
+      await acquireProxy();
+    } catch (err) {
+      log.error(
+        "[opencode-claude] proxy failed to start",
+        err instanceof Error ? err.message : err,
+      );
+    }
+    // The provider and its hook go in before anything slow: until then the
+    // models are missing from OpenCode's catalog, and a session stepping
+    // during a plugin reload fails with "Model unavailable".
+    await ctx.provider.transform((providers) => {
+      providers.add({
+        info: buildProviderInfo(currentProxyBaseUrl()),
+        models: buildClaudeProviderModels(getClaudeModels()),
+      });
+    });
+
+    await ctx.session.hook(
+      "model.request",
+      async (request) => {
+        // Start late if setup could not bind, and always point at the live
+        // listener in case it rebound since the provider was registered.
         await startProxy();
-      } catch (err) {
-        log.error(
-          "[opencode-claude] proxy failed to start during config",
-          err instanceof Error ? err.message : err,
+        request.baseURL = getClaudeProxyBaseUrl();
+        const selected = resolveClaudeModelSelection(
+          request.model.id,
+          request.model.variant,
         );
-      }
-
-      ensureClaudeProviderConfig(
-        config as Record<string, any>,
-        getClaudeModels(),
-      );
-    },
-
-    "chat.headers": async (hookInput, output) => {
-      if (hookInput.model.providerID !== PROVIDER_ID) return;
-      const messageModel = hookInput.message.model as {
-        variant?: unknown;
-      };
-      const variant =
-        typeof messageModel.variant === "string"
-          ? messageModel.variant
-          : undefined;
-      const selected = resolveClaudeModelSelection(hookInput.model.id, variant);
-      output.headers[EFFORT_HEADER] = encodeClaudeModelSelection(selected);
-      // The proxy runs in the long-lived OpenCode server process, whose cwd is
-      // commonly the service account home (for example /home/ubuntu), not the
-      // project attached to this plugin instance. Carry the authoritative
-      // PluginInput directory on every request so Claude Code loads the right
-      // project files, settings, and AGENTS.md.
-      applyClaudeRequestContextHeaders(
-        output.headers,
-        input.directory,
-        hookInput.sessionID,
-      );
-    },
-
-    "chat.params": async (hookInput, output) => {
-      if (hookInput.model.providerID !== PROVIDER_ID) return;
-      delete output.options.reasoningEffort;
-    },
-
-    provider: {
-      id: PROVIDER_ID,
-      async models(provider) {
-        const runtime = await loadClaudeRuntime(provider);
-        return (runtime?.providerModels ?? {}) as Record<string, any>;
+        request.headers[EFFORT_HEADER] = encodeClaudeModelSelection(selected);
+        request.headers[KIND_HEADER] = request.kind;
+        // The proxy runs in the long-lived OpenCode server process, whose cwd
+        // is commonly the service account home, not the project attached to
+        // this plugin instance. Carry the project directory on every request
+        // so Claude Code loads the right project files, settings, and AGENTS.md.
+        applyClaudeRequestContextHeaders(
+          request.headers,
+          directory,
+          request.sessionID,
+        );
       },
-    },
+      { providerID: PROVIDER_ID },
+    );
 
-    auth: {
-      provider: PROVIDER_ID,
-      methods: buildAuthMethods(cliPresent, input.directory),
-    },
-  };
+    const cliPresent = await probeCliPresence();
+    // Refresh the catalog from the CLI in the background; the cached or
+    // fallback list serves until it lands.
+    if (cliPresent) {
+      void refreshModelCatalog(() => ctx.provider.reload());
+    }
+
+    await ctx.integration.transform((integrations) => {
+      for (const registration of buildAuthMethods(cliPresent, directory)) {
+        integrations.method.update(registration);
+      }
+      integrations.update(PROVIDER_ID, (integration) => {
+        integration.name = "Claude Code";
+      });
+    });
+
+    const stopWatching = watchSessionInterrupts(ctx);
+    // Claude Code already moved the session to its fallback model; move the
+    // OpenCode session too so the picker and the next turns match it.
+    setModelFallbackHandler((sessionID, modelId, variant) => {
+      void ctx.session
+        .switchModel({
+          sessionID,
+          model: { id: modelId, providerID: PROVIDER_ID, ...(variant ? { variant } : {}) },
+        })
+        .catch((err: unknown) =>
+          log.warn(
+            "[opencode-claude] could not switch the session to the fallback model",
+            err instanceof Error ? err.message : err,
+          ),
+        );
+    });
+
+    return async () => {
+      stopWatching();
+      await releaseProxy();
+    };
+  },
 };
+
+const INSTALL_METHOD_ID = "claude-cli-install";
+const SIGN_IN_METHOD_ID = "claude-cli";
+
+/**
+ * OpenCode v2 stores whatever an OAuth method resolves with. The CLI keeps
+ * its own login, so this is only a "signed in" marker: no token, nothing
+ * Claude could use, and no refresh hook, so OpenCode never renews it.
+ */
+function cliSignInMarker(methodID: string) {
+  return {
+    type: "oauth" as const,
+    methodID,
+    refresh: "claude-cli",
+    access: "claude-cli",
+    expires: 0,
+  } as any;
+}
 
 /**
  * The method list mirrors what the host actually needs: only the sign-in relay
@@ -313,12 +306,20 @@ export const ClaudeCodePlugin: Plugin = async (
  * `authorize` re-detects, so the install action rolls straight into the relay
  * after a successful install without a restart.
  */
-export function buildAuthMethods(cliPresent: boolean, directory: string) {
+export function buildAuthMethods(
+  cliPresent: boolean,
+  directory: string,
+): AuthRegistration[] {
   if (!cliPresent) {
+    const methodID = INSTALL_METHOD_ID;
     return [
       {
-        type: "oauth" as const,
-        label: "Install Claude Code CLI and sign in",
+        integrationID: PROVIDER_ID,
+        method: {
+          id: methodID,
+          type: "oauth",
+          label: "Install Claude Code CLI and sign in",
+        },
         /**
          * One-click path for hosts without the CLI: install the official
          * Claude Code CLI, then continue with the same sign-in relay. Users
@@ -328,7 +329,7 @@ export function buildAuthMethods(cliPresent: boolean, directory: string) {
         async authorize() {
           const detection = await detectClaudeCode();
           if (detection.loggedIn) {
-            return alreadySignedInResponse();
+            return alreadySignedInResponse(methodID);
           }
           if (detection.status === "missing-cli") {
             const install = await installClaudeCli();
@@ -336,25 +337,32 @@ export function buildAuthMethods(cliPresent: boolean, directory: string) {
               log.warn("[opencode-claude] Claude CLI install failed", {
                 message: install.message,
               });
-              return manualInstallResponse(install.message);
+              return manualInstallResponse(install.message, methodID);
             }
           } else if (detection.status === "missing-sdk") {
             return manualInstallResponse(
               "The Claude Agent SDK is unavailable in this plugin install. Reinstall the plugin, then sign in again.",
+              methodID,
             );
           }
           return relayOrFallback(
             await startClaudeCliLogin({ cwd: directory }),
+            methodID,
           );
         },
-      },
+      } as AuthRegistration,
     ];
   }
 
+  const methodID = SIGN_IN_METHOD_ID;
   return [
     {
-      type: "oauth" as const,
-      label: "Sign in with Claude Code CLI",
+      integrationID: PROVIDER_ID,
+      method: {
+        id: methodID,
+        type: "oauth",
+        label: "Sign in with Claude Code CLI",
+      },
       /**
        * The official CLI runs the whole flow; the host only relays it.
        * `claude auth login --claudeai` prints an authorize URL and then
@@ -369,11 +377,14 @@ export function buildAuthMethods(cliPresent: boolean, directory: string) {
       async authorize() {
         const detection = await detectClaudeCode();
         if (detection.loggedIn) {
-          return alreadySignedInResponse();
+          return alreadySignedInResponse(methodID);
         }
-        return relayOrFallback(await startClaudeCliLogin({ cwd: directory }));
+        return relayOrFallback(
+          await startClaudeCliLogin({ cwd: directory }),
+          methodID,
+        );
       },
-    },
+    } as AuthRegistration,
   ];
 }
 
@@ -384,28 +395,44 @@ export function buildAuthMethods(cliPresent: boolean, directory: string) {
  * missing.
  */
 async function probeCliPresence(): Promise<boolean> {
-  try {
-    const detection = await Promise.race([
-      detectClaudeCode(),
-      new Promise<null>((resolve) => setTimeout(() => resolve(null), 3000)),
-    ]);
-    return detection ? detection.status !== "missing-cli" : true;
-  } catch {
-    return true;
-  }
+  if (cliPresentAt && Date.now() - cliPresentAt < CLI_PRESENT_TTL_MS) return true;
+  if (cliProbe) return cliProbe;
+  const probe = (async () => {
+    try {
+      const detection = await Promise.race([
+        detectClaudeCode(),
+        new Promise<null>((resolve) => setTimeout(() => resolve(null), 3000)),
+      ]);
+      const present = detection ? detection.status !== "missing-cli" : true;
+      // A missing CLI is not remembered, so a fresh install shows at once.
+      if (detection && present) cliPresentAt = Date.now();
+      return present;
+    } catch {
+      return true;
+    }
+  })();
+  cliProbe = probe;
+  void probe.finally(() => {
+    if (cliProbe === probe) cliProbe = undefined;
+  });
+  return cliProbe;
 }
 
-function alreadySignedInResponse() {
+/**
+ * Every location sets the plugin up, all at once after a reload: they share
+ * one probe in flight, and a CLI found present stays so for a while.
+ */
+const CLI_PRESENT_TTL_MS = 5 * 60_000;
+let cliProbe: Promise<boolean> | undefined;
+let cliPresentAt = 0;
+
+function alreadySignedInResponse(methodID: string) {
   return {
     url: "",
     instructions:
       "Claude Code CLI is already signed in. Click Complete — or sign in from a terminal instead with `claude auth login --claudeai`.",
-    method: "auto" as const,
-    async callback() {
-      // OpenCode's callback runtime stores credentials only when success
-      // includes key or refresh. Claude CLI needs neither.
-      return { type: "success" as const } as any;
-    },
+    mode: "auto" as const,
+    callback: Promise.resolve(cliSignInMarker(methodID)),
   };
 }
 
@@ -416,26 +443,27 @@ function alreadySignedInResponse() {
  */
 function relayOrFallback(
   launch: Awaited<ReturnType<typeof startClaudeCliLogin>>,
+  methodID: string,
 ) {
   if (launch.state === "awaiting-code") {
     return {
       url: launch.url,
       instructions:
         "Sign in on the Claude page that opened and paste the code it shows here — or sign in from a terminal instead with `claude auth login --claudeai` and start this sign-in again. If the page did not open, use the sign-in link above.",
-      method: "code" as const,
+      mode: "code" as const,
       async callback(code: string) {
         const submitted = await submitClaudeCliLoginCode(code);
-        if (submitted.ok) return { type: "success" as const } as any;
+        if (submitted.ok) return cliSignInMarker(methodID);
         log.warn("[opencode-claude] Claude CLI login code rejected", {
           message: submitted.message,
         });
         // The CLI can store its grant and still exit oddly; trust its own
         // auth status over the exit code before failing.
         const verified = await detectClaudeCode();
-        if (verified.loggedIn) {
-          return { type: "success" as const } as any;
-        }
-        return { type: "failed" as const };
+        if (verified.loggedIn) return cliSignInMarker(methodID);
+        throw new Error(
+          submitted.message || "Claude Code CLI did not accept the sign-in code.",
+        );
       },
     };
   }
@@ -443,7 +471,7 @@ function relayOrFallback(
   log.warn("[opencode-claude] Claude CLI login launch failed", {
     message: launch.message,
   });
-  return manualInstallResponse(launch.message);
+  return manualInstallResponse(launch.message, methodID);
 }
 
 /**
@@ -451,7 +479,7 @@ function relayOrFallback(
  * install action), and the callback watches `claude auth status` until the
  * grant lands. The message always names both the install and the auth command.
  */
-export function manualInstallResponse(launchMessage: string) {
+export function manualInstallResponse(launchMessage: string, methodID: string) {
   return {
     url: "",
     instructions: `${launchMessage}
@@ -461,24 +489,27 @@ Install Claude Code, sign in, then click Complete:
   claude auth login --claudeai
 
 Or use the “Install Claude Code CLI and sign in” action here instead.`,
-    method: "auto" as const,
-    async callback() {
-      const deadline = Date.now() + 10 * 60_000;
-      while (Date.now() < deadline) {
-        const detection = await detectClaudeCode();
-        if (detection.loggedIn) {
-          return { type: "success" as const } as any;
-        }
-        await new Promise((resolve) => setTimeout(resolve, 1_000));
-      }
-      log.warn("[opencode-claude] Claude CLI login timed out");
-      return { type: "failed" as const };
+    mode: "auto" as const,
+    // v2 hands the host a promise, not a function: polling starts now.
+    get callback() {
+      return waitForCliLogin(methodID);
     },
   };
+}
+
+async function waitForCliLogin(methodID: string) {
+  const deadline = Date.now() + 10 * 60_000;
+  while (Date.now() < deadline) {
+    const detection = await detectClaudeCode();
+    if (detection.loggedIn) return cliSignInMarker(methodID);
+    await new Promise((resolve) => setTimeout(resolve, 1_000));
+  }
+  log.warn("[opencode-claude] Claude CLI login timed out");
+  throw new Error("Timed out waiting for `claude auth login` to finish.");
 }
 
 export default ClaudeCodePlugin;
 
 export { detectClaudeCode } from "./detect.js";
-export { getClaudeModels, CLAUDE_CODE_MODELS } from "./models.js";
+export { getClaudeModels } from "./models.js";
 export { startProxy, stopProxy, getClaudeProxyBaseUrl } from "./proxy.js";
